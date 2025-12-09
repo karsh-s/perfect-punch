@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+celery
+redis
+opencv-python
+mediapipe
+torch
+taipy
+scikit-learn

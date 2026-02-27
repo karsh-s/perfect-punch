@@ -8,3 +8,5 @@ mediapipe
 torch
 taipy
 scikit-learn
+python-dotenv
+openai

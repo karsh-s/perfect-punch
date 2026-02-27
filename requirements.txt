@@ -10,3 +10,4 @@ taipy
 scikit-learn
 python-dotenv
 openai
+numpy

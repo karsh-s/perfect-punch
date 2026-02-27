@@ -285,27 +285,34 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
 
             speed_value = None
             raw_coords = tracker.get_last_fifteen_coords()
-            if raw_coords:
-                first_landmarks = raw_coords[0].get("landmarks")
-                last_landmarks = raw_coords[min(14, len(raw_coords) - 1)].get("landmarks")
-                if first_landmarks and last_landmarks:
-                    distances = []
+            if raw_coords and len(raw_coords) >= 2:
+                fps_value = actual_fps if actual_fps and actual_fps > 0 else 30.0
+
+                # Compute speed for each consecutive frame pair
+                frame_pair_speeds = []
+                for i in range(len(raw_coords) - 1):
+                    lm_a = raw_coords[i].get("landmarks")
+                    lm_b = raw_coords[i + 1].get("landmarks")
+                    if not lm_a or not lm_b:
+                        continue
+                    pair_disps = []
                     for wrist_name in ("RIGHT_WRIST", "LEFT_WRIST"):
-                        if wrist_name in first_landmarks and wrist_name in last_landmarks:
-                            dx = last_landmarks[wrist_name]["x"] - first_landmarks[wrist_name]["x"]
-                            dy = last_landmarks[wrist_name]["y"] - first_landmarks[wrist_name]["y"]
-                            distances.append(math.hypot(dx, dy))
-                    if distances:
-                        distance_px = max(distances)
-                        fps_value = actual_fps if actual_fps and actual_fps > 0 else 30.0
-                        frame_count = min(15, len(raw_coords))
-                        if frame_count > 1 and fps_value:
-                            duration_s = frame_count / fps_value
-                            speed_value = distance_px / duration_s
-                            speed_by_type[CURRENT_TYPE].append(speed_value)
-                            if window_idx is not None:
-                                speed_windows[window_idx][CURRENT_TYPE].append(speed_value)
-                                speed_window_combined[window_idx].append(speed_value)
+                        if wrist_name in lm_a and wrist_name in lm_b:
+                            dx = lm_b[wrist_name]["x"] - lm_a[wrist_name]["x"]
+                            dy = lm_b[wrist_name]["y"] - lm_a[wrist_name]["y"]
+                            pair_disps.append(math.hypot(dx, dy))
+                    if pair_disps:
+                        frame_pair_speeds.append(max(pair_disps) * fps_value)
+
+                if frame_pair_speeds:
+                    # Average the top 3 highest frame-pair speeds
+                    TOP_N = 3
+                    top_speeds = sorted(frame_pair_speeds, reverse=True)[:TOP_N]
+                    speed_value = sum(top_speeds) / len(top_speeds)
+                    speed_by_type[CURRENT_TYPE].append(speed_value)
+                    if window_idx is not None:
+                        speed_windows[window_idx][CURRENT_TYPE].append(speed_value)
+                        speed_window_combined[window_idx].append(speed_value)
 
             coords = tracker.get_last_normalized_coords()
             if coords and len(coords) >= 15:

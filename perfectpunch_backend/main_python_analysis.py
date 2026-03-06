@@ -32,7 +32,7 @@ class Model(nn.Module):
 tracker = PoseTracker(max_frames=15)
 
 model = Model()
-model.load_state_dict(torch.load("models/model_state.pt"))
+model.load_state_dict(torch.load("perfectpunch_backend/models/model_state.pt"))
 model.eval()
 
 mp_drawing = mp.solutions.drawing_utils

@@ -7,11 +7,13 @@ import time
 mp_pose = mp.solutions.pose
 
 class PoseTracker:
-    def __init__(self, max_frames=15):
-        self.pose = mp_pose.Pose(
+    def __init__(self, max_frames=15, pose=None):
+        # Accept external pose instance to avoid duplicate MediaPipe initialization
+        self.pose = pose if pose is not None else mp_pose.Pose(
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         )
+        self._owns_pose = pose is None  # Track if we created the pose (for cleanup)
         self.frame_buffer = deque(maxlen=max_frames)
         self.coord_buffer = deque(maxlen=max_frames)
         self.frame_index = 0

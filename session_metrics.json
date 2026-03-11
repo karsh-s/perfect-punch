@@ -1,8 +1,8 @@
 [
   {
     "fighter_id": "fighter_sample_001",
-    "session_id": "session_20260306_011130",
-    "timestamp": "2026-03-06T01:11:30Z",
+    "session_id": "session_20260311_224449",
+    "timestamp": "2026-03-11T22:44:49Z",
     "metrics": {
       "offense": {
         "punch_accuracy": {

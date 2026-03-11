@@ -4,6 +4,7 @@ from target_utils import respawn_target, wrists_hit_circle, choose_punch_type, P
 import time
 from extractDataPoints import PoseTracker
 import threading
+import concurrent.futures
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +13,9 @@ from datetime import datetime
 import math
 from defense import DefenseGame
 import ctypes
+
+mp_drawing = mp.solutions.drawing_utils
+mp_pose = mp.solutions.pose
 
 class Model(nn.Module):
     def __init__(self, in_features=120, h1=128, h2=64, out_features=3):
@@ -27,16 +31,36 @@ class Model(nn.Module):
         return x
 
 
+# --- Parallel initialization functions ---
+def _load_camera():
+    """Initialize camera and warm it up with first frame read."""
+    cap = cv2.VideoCapture(0)
+    cap.read()  # Warm up - first read is slower
+    return cap
 
+def _load_torch_model():
+    """Load PyTorch punch classifier model."""
+    model = Model()
+    model.load_state_dict(torch.load("perfectpunch_backend/models/model_state.pt"))
+    model.eval()
+    return model
 
-tracker = PoseTracker(max_frames=15)
+def _load_mediapipe_pose():
+    """Initialize MediaPipe Pose (ML model loading is slow)."""
+    return mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-model = Model()
-model.load_state_dict(torch.load("perfectpunch_backend/models/model_state.pt"))
-model.eval()
+# --- Run all heavy initialization in parallel ---
+with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    cap_future = executor.submit(_load_camera)
+    model_future = executor.submit(_load_torch_model)
+    pose_future = executor.submit(_load_mediapipe_pose)
+    
+    cap = cap_future.result()
+    model = model_future.result()
+    shared_pose = pose_future.result()
 
-mp_drawing = mp.solutions.drawing_utils
-mp_pose = mp.solutions.pose
+tracker = PoseTracker(max_frames=15, pose=shared_pose)
+
 TARGET_CENTER = None
 TARGET_RADIUS = 25 
 SPAWN_PROTECT_S = 1
@@ -186,7 +210,6 @@ def update_coverage_metrics(landmarks, w, h):
             exposure_tracker[area_key]["covered"] += 1
 
 start_time = time.time()
-cap = cv2.VideoCapture(0)
 
 # Create window and remove decorations (title bar, buttons) to make it non-movable
 WINDOW_NAME = "Mediapipe Feed (Press q to quit)"
@@ -223,8 +246,7 @@ thread.start()
 
 
 
-with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-    while cap.isOpened():
+while cap.isOpened():
         actual_fps = cap.get(cv2.CAP_PROP_FPS)
         ret, frame = cap.read()
         if not ret or frame is None:
@@ -237,7 +259,7 @@ with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as 
 
         image.flags.writeable = False
 
-        results = pose.process(image)
+        results = shared_pose.process(image)
         
         image.flags.writeable = True
         image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)

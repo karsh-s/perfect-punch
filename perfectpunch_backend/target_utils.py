@@ -1,4 +1,8 @@
+from pathlib import Path
 import random
+
+import cv2
+import numpy as np
 
 try:
     import mediapipe as mp
@@ -15,6 +19,27 @@ PUNCH_COLORS = {
     "hook": (0, 255, 0),       # green
     "uppercut": (255, 0, 0)    # blue
 }
+
+PUBLIC_ASSET_DIR = Path(__file__).resolve().parents[1] / "public"
+TARGET_GLOVE_ASSETS = {
+    "green_left": "green_left.png",
+    "green_right": "green_right.png",
+    "blue_left": "blue_left.png",
+    "blue_right": "blue_right.png",
+}
+
+HAND_CONTACT_LANDMARKS = (
+    # Wrists
+    "LEFT_WRIST",
+    "RIGHT_WRIST",
+    # Fingertips/hand edges commonly reaching glove first
+    "LEFT_INDEX",
+    "RIGHT_INDEX",
+    "LEFT_THUMB",
+    "RIGHT_THUMB",
+    "LEFT_PINKY",
+    "RIGHT_PINKY",
+)
 
 #Convert normalized landmark to pixel coordinates
 def _to_px(lm, w, h):
@@ -51,21 +76,27 @@ def respawn_target(landmarks, w, h, target_radius):
 
     return (random.randint(xmin, xmax), random.randint(ymin, ymax))
 
-#Detect if either wrist is within the target circle
-def wrists_hit_circle(landmarks, w, h, center, radius):
+# Detect if hand landmarks intersect target area.
+# The rendered glove is visually larger than the logical spawn circle,
+# so we expand the collision radius for a more intuitive "what you see is what hits" feel.
+def wrists_hit_circle(landmarks, w, h, center, radius, hit_radius_scale=3.0, min_visibility=0.35):
     if center is None or not MEDIAPIPE_AVAILABLE:
         return False
-        
+
     cx, cy = center
-    for wid in (mp_pose.PoseLandmark.LEFT_WRIST.value,
-                mp_pose.PoseLandmark.RIGHT_WRIST.value):
-        lm = landmarks[wid]
-        if lm.visibility < 0.5:
+    effective_radius = max(1, int(radius * hit_radius_scale))
+
+    for landmark_name in HAND_CONTACT_LANDMARKS:
+        landmark_id = mp_pose.PoseLandmark[landmark_name].value
+        lm = landmarks[landmark_id]
+        if lm.visibility < min_visibility:
             continue
+
         x, y = _to_px(lm, w, h)
         dx, dy = x - cx, y - cy
-        if dx*dx + dy*dy <= radius*radius:
+        if dx * dx + dy * dy <= effective_radius * effective_radius:
             return True
+
     return False
 
 #Randomly choose a punch type based on defined probabilities (Will update to use coach agent to determine probabilities)
@@ -77,3 +108,70 @@ def choose_punch_type():
         return "hook"
     else:
         return "uppercut"
+
+
+def choose_target_glove_key(punch_type=None):
+    if punch_type == "jab":
+        return None
+    return random.choice(list(TARGET_GLOVE_ASSETS.keys()))
+
+
+def load_target_glove_image(glove_key):
+    filename = TARGET_GLOVE_ASSETS.get(glove_key)
+    if not filename:
+        return None
+
+    image_path = PUBLIC_ASSET_DIR / filename
+    if not image_path.exists():
+        return None
+
+    return cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+
+
+def draw_target_glove(frame, center, radius, glove_image, glove_key=None):
+    if frame is None or center is None or glove_image is None:
+        return frame
+
+    cx, cy = center
+    glove_size = max(int(radius * 10), 1)
+    resized = cv2.resize(glove_image, (glove_size, glove_size), interpolation=cv2.INTER_AREA)
+
+    if glove_key is not None and glove_key.startswith("green"):
+        if glove_key.endswith("_right"):
+            resized = cv2.rotate(resized, cv2.ROTATE_90_CLOCKWISE)
+        elif glove_key.endswith("_left"):
+            resized = cv2.rotate(resized, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        glove_size = resized.shape[0]
+
+    x1 = cx - glove_size // 2
+    y1 = cy - glove_size // 2
+    x2 = x1 + glove_size
+    y2 = y1 + glove_size
+
+    frame_h, frame_w = frame.shape[:2]
+    src_x1 = max(0, -x1)
+    src_y1 = max(0, -y1)
+    src_x2 = glove_size - max(0, x2 - frame_w)
+    src_y2 = glove_size - max(0, y2 - frame_h)
+
+    dst_x1 = max(0, x1)
+    dst_y1 = max(0, y1)
+    dst_x2 = min(frame_w, x2)
+    dst_y2 = min(frame_h, y2)
+
+    if dst_x1 >= dst_x2 or dst_y1 >= dst_y2:
+        return frame
+
+    overlay = resized[src_y1:src_y2, src_x1:src_x2]
+    if overlay.shape[2] == 4:
+        overlay_rgb = overlay[:, :, :3].astype(np.float32)
+        alpha = overlay[:, :, 3].astype(np.float32) / 255.0
+        alpha = alpha[:, :, np.newaxis]
+        base = frame[dst_y1:dst_y2, dst_x1:dst_x2].astype(np.float32)
+        blended = overlay_rgb * alpha + base * (1.0 - alpha)
+        frame[dst_y1:dst_y2, dst_x1:dst_x2] = blended.astype(np.uint8)
+    else:
+        frame[dst_y1:dst_y2, dst_x1:dst_x2] = overlay[:, :, :3]
+
+    return frame

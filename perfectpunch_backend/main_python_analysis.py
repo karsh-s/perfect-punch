@@ -1,21 +1,83 @@
 import cv2
 import mediapipe as mp
-from target_utils import respawn_target, wrists_hit_circle, choose_punch_type, PUNCH_COLORS
 import time
-from extractDataPoints import PoseTracker
-import threading
 import concurrent.futures
+import ctypes
+import json
+import math
+from datetime import datetime
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import json
-from datetime import datetime
-import math
+
+from extractDataPoints import PoseTracker
 from defense import DefenseGame
-import ctypes
+from target_utils import (
+    respawn_target,
+    wrists_hit_circle,
+    choose_punch_type,
+    PUNCH_COLORS,
+    choose_target_glove_key,
+    draw_target_glove,
+    load_target_glove_image,
+)
 
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
+
+
+def _get_time_window_index(elapsed_seconds):
+    if elapsed_seconds <= 10:
+        return 0
+    if 10 < elapsed_seconds <= 20:
+        return 1
+    if 20 < elapsed_seconds <= 30:
+        return 2
+    return None
+
+
+def _get_spawn_timing(now, protect_seconds):
+    circle_ts = now
+    return now, circle_ts, circle_ts + protect_seconds
+
+
+def _compute_speed_value(raw_coords, fps_value):
+    if not raw_coords or len(raw_coords) < 2:
+        return None
+
+    frame_pair_speeds = []
+    for i in range(len(raw_coords) - 1):
+        lm_a = raw_coords[i].get("landmarks")
+        lm_b = raw_coords[i + 1].get("landmarks")
+        if not lm_a or not lm_b:
+            continue
+
+        pair_disps = []
+        for wrist_name in ("RIGHT_WRIST", "LEFT_WRIST"):
+            if wrist_name in lm_a and wrist_name in lm_b:
+                dx = lm_b[wrist_name]["x"] - lm_a[wrist_name]["x"]
+                dy = lm_b[wrist_name]["y"] - lm_a[wrist_name]["y"]
+                pair_disps.append(math.hypot(dx, dy))
+
+        if pair_disps:
+            frame_pair_speeds.append(max(pair_disps) * fps_value)
+
+    if not frame_pair_speeds:
+        return None
+
+    # Average the top 3 highest frame-pair speeds.
+    top_speeds = sorted(frame_pair_speeds, reverse=True)[:3]
+    return sum(top_speeds) / len(top_speeds)
+
+
+def _flatten_normalized_features(coords):
+    features = []
+    for record in coords:
+        if record["landmarks"]:
+            for key in record["landmarks"].values():
+                features.extend([key["x"], key["y"]])
+    return features
 
 class Model(nn.Module):
     def __init__(self, in_features=120, h1=128, h2=64, out_features=3):
@@ -34,7 +96,12 @@ class Model(nn.Module):
 # --- Parallel initialization functions ---
 def _load_camera():
     """Initialize camera and warm it up with first frame read."""
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    # Reduce webcam latency by limiting queued frames and capture size.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
+    cap.set(cv2.CAP_PROP_FPS, 30)
     cap.read()  # Warm up - first read is slower
     return cap
 
@@ -47,7 +114,11 @@ def _load_torch_model():
 
 def _load_mediapipe_pose():
     """Initialize MediaPipe Pose (ML model loading is slow)."""
-    return mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    return mp_pose.Pose(
+        model_complexity=0,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
 
 # --- Run all heavy initialization in parallel ---
 with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
@@ -60,14 +131,18 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
     shared_pose = pose_future.result()
 
 tracker = PoseTracker(max_frames=15, pose=shared_pose)
+glove_images = {key: load_target_glove_image(key) for key in ("green_left", "green_right", "blue_left", "blue_right")}
 
 TARGET_CENTER = None
+CURRENT_TYPE = None
+TARGET_GLOVE_KEY = None
 TARGET_RADIUS = 25 
 SPAWN_PROTECT_S = 1
 last_spawn_ts = 0.0
 circle_spawn_ts = None
 protect_release_ts = None
 MAX_RUNTIME = 30
+PRESTART_COUNTDOWN_SECONDS = 3
 
 reaction_time_punch = {"jab": [], "hook": [], "uppercut": []}
 reaction_time_windows = [
@@ -209,8 +284,6 @@ def update_coverage_metrics(landmarks, w, h):
         if is_region_guarded(area_rect):
             exposure_tracker[area_key]["covered"] += 1
 
-start_time = time.time()
-
 # Create window and remove decorations (title bar, buttons) to make it non-movable
 WINDOW_NAME = "Mediapipe Feed (Press q to quit)"
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
@@ -241,8 +314,73 @@ def get_frame():
     ret, frame = cap.read()
     return frame if ret else None
 
-thread = threading.Thread(target = tracker.run, args = (get_frame,))
-thread.start()
+
+def update_tracker_from_landmarks(tracker_obj, landmarks, frame_w, frame_h):
+    """Feed tracker buffers from already-computed landmarks to avoid duplicate pose processing."""
+    tracker_obj.frame_index += 1
+    if landmarks is None:
+        return
+
+    coords = {}
+    selected = (
+        mp_pose.PoseLandmark.RIGHT_ELBOW,
+        mp_pose.PoseLandmark.RIGHT_WRIST,
+        mp_pose.PoseLandmark.LEFT_ELBOW,
+        mp_pose.PoseLandmark.LEFT_WRIST,
+    )
+    for landmark_id in selected:
+        lm = landmarks[landmark_id.value]
+        coords[landmark_id.name] = {
+            "x": int(lm.x * frame_w),
+            "y": int(lm.y * frame_h),
+        }
+
+    tracker_obj.coord_buffer.append({
+        "frame": tracker_obj.frame_index,
+        "landmarks": coords,
+    })
+
+
+def render_countdown_frame(frame, countdown_value):
+    """Darken frame and draw a large centered countdown number."""
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), thickness=-1)
+    dimmed = cv2.addWeighted(overlay, 0.45, frame, 0.55, 0)
+
+    countdown_text = str(countdown_value)
+    font = cv2.FONT_HERSHEY_DUPLEX
+    font_scale = max(2.0, min(w, h) / 180.0)
+    thickness = max(4, int(font_scale * 2))
+    text_size, _ = cv2.getTextSize(countdown_text, font, font_scale, thickness)
+    text_x = (w - text_size[0]) // 2
+    text_y = (h + text_size[1]) // 2
+
+    cv2.putText(dimmed, countdown_text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    return dimmed
+
+# Pre-start countdown shown directly on the cv2 window.
+countdown_start = time.time()
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        continue
+
+    elapsed_countdown = time.time() - countdown_start
+    remaining = PRESTART_COUNTDOWN_SECONDS - int(elapsed_countdown)
+
+    if remaining <= 0:
+        break
+
+    countdown_frame = render_countdown_frame(cv2.flip(frame, 1), remaining)
+    cv2.imshow(WINDOW_NAME, countdown_frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        cap.release()
+        cv2.destroyAllWindows()
+        quit()
+
+start_time = time.time()
 
 
 
@@ -272,15 +410,16 @@ while cap.isOpened():
         except AttributeError:
             landmarks = None
 
+        update_tracker_from_landmarks(tracker, landmarks, w, h)
+
         
 
         if TARGET_CENTER is None and landmarks is not None:
             TARGET_CENTER = respawn_target(landmarks, w, h, TARGET_RADIUS)
             CURRENT_TYPE = choose_punch_type()
+            TARGET_GLOVE_KEY = choose_target_glove_key(CURRENT_TYPE)
             print(CURRENT_TYPE)
-            last_spawn_ts = now
-            circle_spawn_ts = last_spawn_ts
-            protect_release_ts = circle_spawn_ts + SPAWN_PROTECT_S
+            last_spawn_ts, circle_spawn_ts, protect_release_ts = _get_spawn_timing(now, SPAWN_PROTECT_S)
 
         collide = False
         protecting = protect_release_ts is not None and now < protect_release_ts
@@ -293,57 +432,25 @@ while cap.isOpened():
 
             reaction_time_punch[CURRENT_TYPE].append(reaction_time)
 
-            window_idx = None
-            if elapsed <= 10:
-                window_idx = 0
-            elif 10 < elapsed <= 20:
-                window_idx = 1
-            elif 20 < elapsed <= 30:
-                window_idx = 2
+            window_idx = _get_time_window_index(elapsed)
 
             if window_idx is not None:
                 reaction_time_windows[window_idx][CURRENT_TYPE].append(reaction_time)
                 reaction_window_combined[window_idx].append(reaction_time)
 
-            speed_value = None
             raw_coords = tracker.get_last_fifteen_coords()
-            if raw_coords and len(raw_coords) >= 2:
-                fps_value = actual_fps if actual_fps and actual_fps > 0 else 30.0
-
-                # Compute speed for each consecutive frame pair
-                frame_pair_speeds = []
-                for i in range(len(raw_coords) - 1):
-                    lm_a = raw_coords[i].get("landmarks")
-                    lm_b = raw_coords[i + 1].get("landmarks")
-                    if not lm_a or not lm_b:
-                        continue
-                    pair_disps = []
-                    for wrist_name in ("RIGHT_WRIST", "LEFT_WRIST"):
-                        if wrist_name in lm_a and wrist_name in lm_b:
-                            dx = lm_b[wrist_name]["x"] - lm_a[wrist_name]["x"]
-                            dy = lm_b[wrist_name]["y"] - lm_a[wrist_name]["y"]
-                            pair_disps.append(math.hypot(dx, dy))
-                    if pair_disps:
-                        frame_pair_speeds.append(max(pair_disps) * fps_value)
-
-                if frame_pair_speeds:
-                    # Average the top 3 highest frame-pair speeds
-                    TOP_N = 3
-                    top_speeds = sorted(frame_pair_speeds, reverse=True)[:TOP_N]
-                    speed_value = sum(top_speeds) / len(top_speeds)
-                    speed_by_type[CURRENT_TYPE].append(speed_value)
-                    if window_idx is not None:
-                        speed_windows[window_idx][CURRENT_TYPE].append(speed_value)
-                        speed_window_combined[window_idx].append(speed_value)
+            fps_value = actual_fps if actual_fps and actual_fps > 0 else 30.0
+            speed_value = _compute_speed_value(raw_coords, fps_value)
+            if speed_value is not None:
+                speed_by_type[CURRENT_TYPE].append(speed_value)
+                if window_idx is not None:
+                    speed_windows[window_idx][CURRENT_TYPE].append(speed_value)
+                    speed_window_combined[window_idx].append(speed_value)
 
             coords = tracker.get_last_normalized_coords()
             if coords and len(coords) >= 15:
                 # Flatten and normalize like in training
-                features = []
-                for record in coords:
-                    if record["landmarks"]:
-                        for key in record["landmarks"].values():
-                            features.extend([key["x"], key["y"]])
+                features = _flatten_normalized_features(coords)
                 if len(features) == 120:
                     x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)  # shape [1, 120]
                     with torch.no_grad():
@@ -366,24 +473,26 @@ while cap.isOpened():
                     print(f"Predicted Punch: {predicted_punch}")
             TARGET_CENTER = respawn_target(landmarks, w, h, TARGET_RADIUS)
             CURRENT_TYPE = choose_punch_type()
+            TARGET_GLOVE_KEY = choose_target_glove_key(CURRENT_TYPE)
             print(CURRENT_TYPE, "<-----")
             print(correct_by_type)
             print(attempts_by_type)
-            last_spawn_ts = now
-            circle_spawn_ts = last_spawn_ts
-            protect_release_ts = circle_spawn_ts + SPAWN_PROTECT_S
+            last_spawn_ts, circle_spawn_ts, protect_release_ts = _get_spawn_timing(now, SPAWN_PROTECT_S)
         
         if TARGET_CENTER is not None and CURRENT_TYPE is not None:
-            color = PUNCH_COLORS.get(CURRENT_TYPE, (0, 0, 255))
-            cv2.circle(image, TARGET_CENTER, TARGET_RADIUS, color, -1)
+            glove_image = glove_images.get(TARGET_GLOVE_KEY)
+            if CURRENT_TYPE != "jab" and glove_image is not None:
+                draw_target_glove(image, TARGET_CENTER, TARGET_RADIUS, glove_image, TARGET_GLOVE_KEY)
+            else:
+                color = PUNCH_COLORS.get(CURRENT_TYPE, (0, 0, 255))
+                cv2.circle(image, TARGET_CENTER, TARGET_RADIUS, color, -1)
 
         defense_game.update(image, landmarks, now)
-        defense_stats = defense_game.get_stats()
 
         display_image = cv2.flip(image, 1)
         cv2.imshow(WINDOW_NAME, display_image)
 
-        if cv2.waitKey(10) & 0xFF == ord('q'):
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
         if elapsed >= MAX_RUNTIME:
             break
@@ -601,7 +710,6 @@ print(
 )
 
 tracker.stop()
-thread.join(timeout=1.0)
 cap.release()
 cv2.destroyAllWindows()
 quit()

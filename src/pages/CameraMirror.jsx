@@ -19,6 +19,9 @@ const buildWsUrl = (path) => {
 };
 
 export default function CameraMirror({ onNavigate, onGoToDashboard }) {
+  const STREAM_WIDTH = 960;
+  const STREAM_HEIGHT = 540;
+
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const wsRef = useRef(null);
@@ -31,7 +34,7 @@ export default function CameraMirror({ onNavigate, onGoToDashboard }) {
   const [currentTarget, setCurrentTarget] = useState(null);
   const [score, setScore] = useState(0);
   const [timeRemaining, setTimeRemaining] = useState(30);
-  const [landmarkBuffer, setLandmarkBuffer] = useState([]);
+  const [preStartCountdown, setPreStartCountdown] = useState(3);
   const [isDemoMode, setIsDemoMode] = useState(false);
   const [gameData, setGameData] = useState({
     punchAttempts: [],
@@ -48,6 +51,7 @@ export default function CameraMirror({ onNavigate, onGoToDashboard }) {
   const gameStartTimeRef = useRef(null);
   const isDemoModeRef = useRef(false);
   const hitTargetsRef = useRef(new Set());
+  const landmarkBufferRef = useRef([]);
   
   useEffect(() => {
     scoreRef.current = score;
@@ -78,7 +82,23 @@ export default function CameraMirror({ onNavigate, onGoToDashboard }) {
   
   // Initialize game session
   useEffect(() => {
-    const startGame = async () => {
+    let isCancelled = false;
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    const runPreStartCountdown = async () => {
+      for (let count = 3; count >= 1; count -= 1) {
+        if (isCancelled) return false;
+        setPreStartCountdown(count);
+        await sleep(1000);
+      }
+
+      if (isCancelled) return false;
+      setPreStartCountdown(null);
+      return true;
+    };
+
+    const initializeLiveSession = async () => {
       try {
         const createResponse = await fetch(buildHttpUrl('/game/sessions'), {
           method: 'POST',
@@ -100,7 +120,7 @@ export default function CameraMirror({ onNavigate, onGoToDashboard }) {
         setScore(session.score ?? 0);
         setTimeRemaining(session.duration_seconds ?? 30);
         setCurrentTarget(null);
-        setLandmarkBuffer([]);
+        landmarkBufferRef.current = [];
 
         const startResponse = await fetch(buildHttpUrl(`/game/sessions/${session.session_id}/start`), {
           method: 'POST',
@@ -182,32 +202,51 @@ export default function CameraMirror({ onNavigate, onGoToDashboard }) {
             statsIntervalRef.current = null;
           }
         };
+
+        return { mode: 'live' };
       } catch (error) {
         console.warn('Backend not available, starting demo mode:', error);
-        // Start demo mode
-        const demoSessionId = `demo-${Date.now()}`;
-        setSessionId(demoSessionId);
-        setIsDemoMode(true);
-        setScore(0);
-        scoreRef.current = 0;
-        setTimeRemaining(30);
-        setCurrentTarget(null);
-        setLandmarkBuffer([]);
-        hitTargetsRef.current.clear();
-        gameStartTimeRef.current = Date.now();
-        setGameData({
-          punchAttempts: [],
-          targetsHit: 0,
-          targetsSpawned: 0,
-          startTime: gameStartTimeRef.current
-        });
-        startDemoGame();
+        return { mode: 'demo' };
+      }
+    };
+
+    const startDemoMode = () => {
+      const demoSessionId = `demo-${Date.now()}`;
+      setSessionId(demoSessionId);
+      setIsDemoMode(true);
+      setScore(0);
+      scoreRef.current = 0;
+      setTimeRemaining(30);
+      setCurrentTarget(null);
+      landmarkBufferRef.current = [];
+      hitTargetsRef.current.clear();
+      gameStartTimeRef.current = Date.now();
+      setGameData({
+        punchAttempts: [],
+        targetsHit: 0,
+        targetsSpawned: 0,
+        startTime: gameStartTimeRef.current
+      });
+      startDemoGame();
+    };
+
+    const startGame = async () => {
+      // Run countdown and backend session setup in parallel to reduce perceived startup delay.
+      const [shouldContinue, initResult] = await Promise.all([
+        runPreStartCountdown(),
+        initializeLiveSession()
+      ]);
+
+      if (!shouldContinue || isCancelled) return;
+      if (initResult?.mode === 'demo') {
+        startDemoMode();
       }
     };
     
     startGame();
     
     return () => {
+      isCancelled = true;
       if (wsRef.current) {
         wsRef.current.close();
       }
@@ -387,10 +426,10 @@ export default function CameraMirror({ onNavigate, onGoToDashboard }) {
     });
     
     pose.setOptions({
-      modelComplexity: 1,
+      modelComplexity: 0,
       smoothLandmarks: true,
-      minDetectionConfidence: 0.5,
-      minTrackingConfidence: 0.5
+      minDetectionConfidence: 0.45,
+      minTrackingConfidence: 0.45
     });
     
     pose.onResults((results) => {
@@ -409,8 +448,9 @@ export default function CameraMirror({ onNavigate, onGoToDashboard }) {
         const normalized = extractLandmarks(results.poseLandmarks, canvas.width, canvas.height);
         const serializedLandmarks = serializeLandmarks(results.poseLandmarks);
         
-        setLandmarkBuffer((prev) => {
-          const newBuffer = [...prev, normalized].slice(-15);
+        {
+          const newBuffer = [...landmarkBufferRef.current, normalized].slice(-15);
+          landmarkBufferRef.current = newBuffer;
 
           const normalizedBuffer = (() => {
             const names = ['RIGHT_ELBOW','RIGHT_WRIST','LEFT_ELBOW','LEFT_WRIST'];
@@ -456,9 +496,7 @@ export default function CameraMirror({ onNavigate, onGoToDashboard }) {
               },
             }));
           }
-
-          return newBuffer;
-        });
+        }
       }
       
       const activeTarget = targetRef.current;
@@ -492,8 +530,8 @@ export default function CameraMirror({ onNavigate, onGoToDashboard }) {
       onFrame: async () => {
         await pose.send({ image: videoRef.current });
       },
-      width: 1280,
-      height: 720
+      width: STREAM_WIDTH,
+      height: STREAM_HEIGHT
     });
     
     camera.start();
@@ -716,10 +754,36 @@ export default function CameraMirror({ onNavigate, onGoToDashboard }) {
       />
       <canvas 
         ref={canvasRef} 
-        width={1280} 
-        height={720}
+        width={STREAM_WIDTH} 
+        height={STREAM_HEIGHT}
         style={{ width: '100%', height: '100%', objectFit: 'contain' }}
       />
+      {preStartCountdown !== null && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            background: 'rgba(0, 0, 0, 0.45)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 20,
+            pointerEvents: 'none'
+          }}
+        >
+          <div
+            style={{
+              color: '#FFFFFF',
+              fontSize: 'clamp(96px, 20vw, 260px)',
+              fontWeight: 800,
+              lineHeight: 1,
+              textShadow: '0 8px 24px rgba(0, 0, 0, 0.65)'
+            }}
+          >
+            {preStartCountdown}
+          </div>
+        </div>
+      )}
       <button 
         onClick={endGame}
         style={{

@@ -149,13 +149,17 @@ const DashboardPage = ({ onNavigate, sessionId = null }) => {
   if (loading) {
     return (
       <div
-        className="min-h-screen text-white flex items-center justify-center"
         style={{
+          minHeight: "100vh",
+          color: "white",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
           background:
             "linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 25%, #16213e 50%, #1a1a2e 75%, #0a0a0f 100%)",
         }}
       >
-        <div className="text-2xl" style={{ color: "#b0b0b8" }}>
+        <div style={{ fontSize: "1.5rem", color: "#b0b0b8" }}>
           Loading dashboard...
         </div>
       </div>
@@ -165,18 +169,24 @@ const DashboardPage = ({ onNavigate, sessionId = null }) => {
   if (!sessionData) {
     return (
       <div
-        className="min-h-screen text-white flex items-center justify-center flex-col space-y-6"
         style={{
+          minHeight: "100vh",
+          color: "white",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          flexDirection: "column",
+          gap: "24px",
           background:
             "linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 25%, #16213e 50%, #1a1a2e 75%, #0a0a0f 100%)",
         }}
       >
-        <div className="text-2xl font-bold text-center" style={{ color: "#ff6b6b" }}>
+        <div style={{ fontSize: "1.5rem", fontWeight: "700", textAlign: "center", color: "#ff6b6b" }}>
           ⚠️ Using static data - play a new game to see your data
         </div>
-        <div className="text-lg text-center max-w-md" style={{ color: "#b0b0b8" }}>
+        <div style={{ fontSize: "1.125rem", textAlign: "center", maxWidth: "600px", color: "#b0b0b8" }}>
           No session data found. To see your real game data:
-          <ol className="mt-4 text-left list-decimal list-inside space-y-2">
+          <ol style={{ marginTop: "16px", paddingLeft: "20px", textAlign: "left", listStyleType: "decimal" }}>
             <li>Go to the Landing page</li>
             <li>Click "Start Analysis" to play a game</li>
             <li>Hit some targets and click "End Game"</li>
@@ -295,8 +305,16 @@ const DashboardPage = ({ onNavigate, sessionId = null }) => {
   // ---------------------------------------------------------
   return (
     <main
-      className="min-h-screen text-white p-10 flex flex-col items-center space-y-8 relative overflow-hidden"
       style={{
+        minHeight: "100vh",
+        color: "white",
+        padding: "40px",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        gap: "32px",
+        position: "relative",
+        overflow: "hidden",
         background:
           "linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 25%, #16213e 50%, #1a1a2e 75%, #0a0a0f 100%)",
       }}
@@ -313,7 +331,7 @@ const DashboardPage = ({ onNavigate, sessionId = null }) => {
       />
 
       {/* Navigation */}
-      <nav className="w-full flex justify-between items-center mb-4 relative z-10">
+      <nav style={{ width: '100%', display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', position: 'relative', zIndex: 10 }}>
         <div style={{ color: "#b0b0b8" }}>
           <div style={{ fontSize: "0.9rem" }}>
             {formatSessionDate(sessionData.timestamp)}
@@ -342,10 +360,13 @@ const DashboardPage = ({ onNavigate, sessionId = null }) => {
       </nav>
 
       {/* Title */}
-      <div className="text-center relative z-10 w-full">
+      <div style={{ textAlign: 'center', position: 'relative', zIndex: 10, width: '100%' }}>
         <h1
-          className="text-6xl font-extrabold drop-shadow-lg mb-2"
           style={{
+            fontSize: '3.75rem', // 6xl
+            fontWeight: '800',
+            filter: 'drop-shadow(0 4px 6px rgba(0,0,0,0.1))',
+            marginBottom: '8px',
             background:
               "linear-gradient(135deg, #ff6b6b 0%, #ff8787 50%, #ff6b6b 100%)",
             WebkitBackgroundClip: "text",
@@ -354,148 +375,155 @@ const DashboardPage = ({ onNavigate, sessionId = null }) => {
         >
           🥊 PERFECTPUNCH DASHBOARD
         </h1>
-        <p className="text-xl" style={{ color: "#b0b0b8" }}>
+        <p style={{ fontSize: '1.25rem', color: "#b0b0b8" }}>
           Today's Training Session
         </p>
-        <p className="text-lg mt-1" style={{ color: "#9ca3af" }}>
+        <p style={{ fontSize: '1.125rem', marginTop: '4px', color: "#9ca3af" }}>
           {totalPunches} total punches
         </p>
       </div>
 
       {/* SUMMARY CARDS - Only Show Recorded Data */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-6 w-full relative z-10">
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', md: { gridTemplateColumns: 'repeat(3, 1fr)' }, lg: { gridTemplateColumns: 'repeat(6, 1fr)' }, gap: '24px', width: '100%', position: 'relative', zIndex: 10 }}>
         {/* Score */}
         <div
-          className="rounded-2xl p-6"
           style={{
+            borderRadius: '16px',
+            padding: '24px',
             background: "rgba(255, 255, 255, 0.05)",
             border: "1px solid rgba(255, 255, 255, 0.1)",
             boxShadow: "0 8px 24px rgba(0, 0, 0, 0.3)",
           }}
         >
-          <div className="flex items-center gap-3 mb-2">
-            <div className="w-3 h-3 rounded-full" style={{ backgroundColor: "#ff6b6b" }}></div>
-            <h2 className="text-sm font-semibold" style={{ color: "#b0b0b8" }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px' }}>
+            <div style={{ width: '12px', height: '12px', borderRadius: '9999px', backgroundColor: "#ff6b6b" }}></div>
+            <h2 style={{ fontSize: '0.875rem', fontWeight: '600', color: "#b0b0b8" }}>
               Score
             </h2>
           </div>
-          <p className="text-3xl font-extrabold" style={{ color: "#ff6b6b" }}>
+          <p style={{ fontSize: '1.875rem', fontWeight: '800', color: "#ff6b6b" }}>
             {sessionData.summary?.score ?? 0}
           </p>
         </div>
 
         {/* Average Punch Speed */}
         <div
-          className="rounded-2xl p-6"
           style={{
+            borderRadius: '16px',
+            padding: '24px',
             background: "rgba(255, 255, 255, 0.05)",
             border: "1px solid rgba(255, 255, 255, 0.1)",
             boxShadow: "0 8px 24px rgba(0, 0, 0, 0.3)",
           }}
         >
-          <div className="flex items-center gap-3 mb-2">
-            <div className="w-3 h-3 rounded-full" style={{ backgroundColor: "#ff6b6b" }}></div>
-            <h2 className="text-sm font-semibold" style={{ color: "#b0b0b8" }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px' }}>
+            <div style={{ width: '12px', height: '12px', borderRadius: '9999px', backgroundColor: "#ff6b6b" }}></div>
+            <h2 style={{ fontSize: '0.875rem', fontWeight: '600', color: "#b0b0b8" }}>
               Avg Punch Speed
             </h2>
           </div>
-          <p className="text-3xl font-extrabold" style={{ color: "#ff6b6b" }}>
+          <p style={{ fontSize: '1.875rem', fontWeight: '800', color: "#ff6b6b" }}>
             {avgVelocityMph.toFixed(1)} mph
           </p>
         </div>
 
         {/* Reaction Time */}
         <div
-          className="rounded-2xl p-6"
           style={{
+            borderRadius: '16px',
+            padding: '24px',
             background: "rgba(255, 255, 255, 0.05)",
             border: "1px solid rgba(255, 255, 255, 0.1)",
             boxShadow: "0 8px 24px rgba(0, 0, 0, 0.3)",
           }}
         >
-          <div className="flex items-center gap-3 mb-2">
-            <div className="w-3 h-3 rounded-full" style={{ backgroundColor: "#ff6b6b" }}></div>
-            <h2 className="text-sm font-semibold" style={{ color: "#b0b0b8" }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px' }}>
+            <div style={{ width: '12px', height: '12px', borderRadius: '9999px', backgroundColor: "#ff6b6b" }}></div>
+            <h2 style={{ fontSize: '0.875rem', fontWeight: '600', color: "#b0b0b8" }}>
               Reaction Time
             </h2>
           </div>
-          <p className="text-3xl font-extrabold" style={{ color: "#ff6b6b" }}>
+          <p style={{ fontSize: '1.875rem', fontWeight: '800', color: "#ff6b6b" }}>
             {sessionData.summary?.avg_reaction_time ?? 0} ms
           </p>
         </div>
 
         {/* Accuracy */}
         <div
-          className="rounded-2xl p-6"
           style={{
+            borderRadius: '16px',
+            padding: '24px',
             background: "rgba(255, 255, 255, 0.05)",
             border: "1px solid rgba(255, 255, 255, 0.1)",
             boxShadow: "0 8px 24px rgba(0, 0, 0, 0.3)",
           }}
         >
-          <div className="flex items-center gap-3 mb-2">
-            <div className="w-3 h-3 rounded-full" style={{ backgroundColor: "#ff6b6b" }}></div>
-            <h2 className="text-sm font-semibold" style={{ color: "#b0b0b8" }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px' }}>
+            <div style={{ width: '12px', height: '12px', borderRadius: '9999px', backgroundColor: "#ff6b6b" }}></div>
+            <h2 style={{ fontSize: '0.875rem', fontWeight: '600', color: "#b0b0b8" }}>
               Accuracy
             </h2>
           </div>
-          <p className="text-3xl font-extrabold" style={{ color: "#ff6b6b" }}>
+          <p style={{ fontSize: '1.875rem', fontWeight: '800', color: "#ff6b6b" }}>
             {(sessionData.summary?.accuracy ?? 0).toFixed(1)}%
           </p>
         </div>
 
         {/* Critical Prevention */}
         <div
-          className="rounded-2xl p-6"
           style={{
+            borderRadius: '16px',
+            padding: '24px',
             background: "rgba(255, 255, 255, 0.05)",
             border: "1px solid rgba(255, 255, 255, 0.1)",
             boxShadow: "0 8px 24px rgba(0, 0, 0, 0.3)",
           }}
         >
-          <div className="flex items-center gap-3 mb-2">
-            <div className="w-3 h-3 rounded-full" style={{ backgroundColor: "#ff6b6b" }}></div>
-            <h2 className="text-sm font-semibold" style={{ color: "#b0b0b8" }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px' }}>
+            <div style={{ width: '12px', height: '12px', borderRadius: '9999px', backgroundColor: "#ff6b6b" }}></div>
+            <h2 style={{ fontSize: '0.875rem', fontWeight: '600', color: "#b0b0b8" }}>
               Critical Prevention
             </h2>
           </div>
-          <p className="text-3xl font-extrabold" style={{ color: "#ff6b6b" }}>
+          <p style={{ fontSize: '1.875rem', fontWeight: '800', color: "#ff6b6b" }}>
             {(sessionData.summary?.critical_prevention ?? 0).toFixed(1)}%
           </p>
         </div>
 
         {/* Total Punches */}
         <div
-          className="rounded-2xl p-6"
           style={{
+            borderRadius: '16px',
+            padding: '24px',
             background: "rgba(255, 255, 255, 0.05)",
             border: "1px solid rgba(255, 255, 255, 0.1)",
             boxShadow: "0 8px 24px rgba(0, 0, 0, 0.3)",
           }}
         >
-          <div className="flex items-center gap-3 mb-2">
-            <div className="w-3 h-3 rounded-full" style={{ backgroundColor: "#ff6b6b" }}></div>
-            <h2 className="text-sm font-semibold" style={{ color: "#b0b0b8" }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px' }}>
+            <div style={{ width: '12px', height: '12px', borderRadius: '9999px', backgroundColor: "#ff6b6b" }}></div>
+            <h2 style={{ fontSize: '0.875rem', fontWeight: '600', color: "#b0b0b8" }}>
               Total Punches
             </h2>
           </div>
-          <p className="text-3xl font-extrabold" style={{ color: "#ff6b6b" }}>
+          <p style={{ fontSize: '1.875rem', fontWeight: '800', color: "#ff6b6b" }}>
             {totalPunches}
           </p>
         </div>
       </div>
 
       {/* CHARTS - 3 Column Layout */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 w-full relative z-10">
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(1, 1fr)', lg: { gridTemplateColumns: 'repeat(3, 1fr)' }, gap: '32px', width: '100%', position: 'relative', zIndex: 10 }}>
         {/* Punch Accuracy */}
         <section
-          className="rounded-2xl p-8"
           style={{
+            borderRadius: '16px',
+            padding: '32px',
             background: "rgba(255, 255, 255, 0.05)",
             border: "1px solid rgba(255, 255, 255, 0.1)",
           }}
         >
-          <h2 className="text-2xl font-bold text-center mb-6">
+          <h2 style={{ fontSize: '1.5rem', fontWeight: '700', textAlign: 'center', marginBottom: '24px' }}>
             Punch Accuracy
           </h2>
           <ResponsiveContainer width="100%" height={300}>
@@ -511,13 +539,14 @@ const DashboardPage = ({ onNavigate, sessionId = null }) => {
 
         {/* Reaction Times */}
         <section
-          className="rounded-2xl p-8"
           style={{
+            borderRadius: '16px',
+            padding: '32px',
             background: "rgba(255, 255, 255, 0.05)",
             border: "1px solid rgba(255, 255, 255, 0.1)",
           }}
         >
-          <h2 className="text-2xl font-bold text-center mb-6">
+          <h2 style={{ fontSize: '1.5rem', fontWeight: '700', textAlign: 'center', marginBottom: '24px' }}>
             Reaction Times
           </h2>
           <ResponsiveContainer width="100%" height={300}>
@@ -533,13 +562,14 @@ const DashboardPage = ({ onNavigate, sessionId = null }) => {
 
         {/* Defense Breakdown */}
         <section
-          className="rounded-2xl p-8"
           style={{
+            borderRadius: '16px',
+            padding: '32px',
             background: "rgba(255, 255, 255, 0.05)",
             border: "1px solid rgba(255, 255, 255, 0.1)",
           }}
         >
-          <h2 className="text-2xl font-bold text-center mb-6">
+          <h2 style={{ fontSize: '1.5rem', fontWeight: '700', textAlign: 'center', marginBottom: '24px' }}>
             Defense Breakdown
           </h2>
           <ResponsiveContainer width="100%" height={300}>
@@ -557,22 +587,23 @@ const DashboardPage = ({ onNavigate, sessionId = null }) => {
               <Tooltip />
             </PieChart>
           </ResponsiveContainer>
-          <p className="text-xs text-center mt-2" style={{ color: "#6b7280" }}>
+          <p style={{ fontSize: '0.75rem', textAlign: 'center', marginTop: '8px', color: "#6b7280" }}>
             Hover over the chart for details
           </p>
         </section>
       </div>
 
       {/* PERFORMANCE OVER SESSION - Full Width */}
-      <div className="w-full relative z-10">
+      <div style={{ width: '100%', position: 'relative', zIndex: 10 }}>
         <section
-          className="rounded-2xl p-8"
           style={{
+            borderRadius: '16px',
+            padding: '32px',
             background: "rgba(255, 255, 255, 0.05)",
             border: "1px solid rgba(255, 255, 255, 0.1)",
           }}
         >
-          <h2 className="text-2xl font-bold text-center mb-6">
+          <h2 style={{ fontSize: '1.5rem', fontWeight: '700', textAlign: 'center', marginBottom: '24px' }}>
             Performance Over Session
           </h2>
           <ResponsiveContainer width="100%" height={400}>

@@ -6,6 +6,10 @@ from supabase import create_client
 from pydantic import BaseModel
 import os
 import json
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # ----------------------
 # Supabase Setup
@@ -148,7 +152,7 @@ async def end_game(session_id: str, user = Depends(get_current_user)):
     return stats
 
 
-@app.get("/api/game/latest")
+@app.get("/session/latest")
 async def get_latest_game(user = Depends(get_current_user)):
     """
     Retrieve the most recent completed session for the current user.

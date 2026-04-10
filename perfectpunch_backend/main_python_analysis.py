@@ -131,7 +131,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
     shared_pose = pose_future.result()
 
 tracker = PoseTracker(max_frames=15, pose=shared_pose)
-glove_images = {key: load_target_glove_image(key) for key in ("green_left", "green_right", "blue_left", "blue_right")}
+glove_images = {key: load_target_glove_image(key) for key in ("green_left", "green_right", "uppercut_left", "uppercut_right", "jab_left", "jab_right")}
 
 TARGET_CENTER = None
 CURRENT_TYPE = None
@@ -359,7 +359,163 @@ def render_countdown_frame(frame, countdown_value):
     cv2.putText(dimmed, countdown_text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
     return dimmed
 
-# Pre-start countdown shown directly on the cv2 window.
+
+def calibration_checker(frame, landmarks, w, h):
+    """
+    Check if user is positioned correctly based on shoulder width ratio.
+    Returns positioning status and whether calibration is complete.
+    
+    - Shoulders too close: ratio > 0.30 (user too close to camera)
+    - Shoulders too far: ratio < 0.15 (user too far from camera)
+    - Correct position: 0.15 <= ratio <= 0.30
+    """
+    if landmarks is None:
+        return frame, None, 0, "", (128, 128, 128)
+    
+    try:
+        left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+        right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+        
+        # Calculate shoulder positions in pixels
+        left_x = int(left_shoulder.x * w)
+        right_x = int(right_shoulder.x * w)
+        
+        # Calculate shoulder width ratio (shoulder distance / frame width)
+        shoulder_distance = abs(right_x - left_x)
+        shoulder_ratio = shoulder_distance / w if w > 0 else 0
+        
+        # Determine positioning status
+        if shoulder_ratio > 0.30:
+            status = "TOO CLOSE"
+            color = (0, 0, 255)  # Red
+            feedback = "Step back"
+        elif shoulder_ratio < 0.15:
+            status = "TOO FAR"
+            color = (0, 165, 255)  # Orange
+            feedback = "Step closer"
+        else:
+            status = "CORRECT POSITION"
+            color = (0, 255, 0)  # Green
+            feedback = "Stay still"
+        
+        return frame, status, shoulder_ratio, feedback, color
+        
+    except (AttributeError, IndexError):
+        return frame, None, 0, "", (128, 128, 128)
+
+
+def draw_calibration_frame(frame, status, shoulder_ratio, feedback, color):
+    """Draw calibration feedback on frame."""
+    h, w = frame.shape[:2]
+    
+    # Darken frame slightly
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), thickness=-1)
+    frame = cv2.addWeighted(overlay, 0.2, frame, 0.8, 0)
+    
+    font = cv2.FONT_HERSHEY_DUPLEX
+    font_scale = 1.5
+    thickness = 3
+    
+    # Draw status text
+    if status:
+        status_size, _ = cv2.getTextSize(status, font, font_scale, thickness)
+        status_x = (w - status_size[0]) // 2
+        status_y = h // 3
+        cv2.putText(frame, status, (status_x, status_y), font, font_scale, color, thickness, cv2.LINE_AA)
+    
+    # Draw feedback text
+    feedback_font_scale = 1.2
+    if feedback:
+        feedback_size, _ = cv2.getTextSize(feedback, font, feedback_font_scale, thickness)
+        feedback_x = (w - feedback_size[0]) // 2
+        feedback_y = h // 2
+        cv2.putText(frame, feedback, (feedback_x, feedback_y), font, feedback_font_scale, color, thickness, cv2.LINE_AA)
+    
+    # Draw target ratio range
+    range_text = "Optimal: 0.15 - 0.30"
+    ratio_text = f"Current: {shoulder_ratio:.3f}"
+    small_font_scale = 0.8
+    
+    range_size, _ = cv2.getTextSize(range_text, font, small_font_scale, 2)
+    range_x = (w - range_size[0]) // 2
+    range_y = 2 * h // 3
+    cv2.putText(frame, range_text, (range_x, range_y), font, small_font_scale, (200, 200, 200), 2, cv2.LINE_AA)
+    
+    ratio_size, _ = cv2.getTextSize(ratio_text, font, small_font_scale, 2)
+    ratio_x = (w - ratio_size[0]) // 2
+    ratio_y = 2 * h // 3 + 40
+    cv2.putText(frame, ratio_text, (ratio_x, ratio_y), font, small_font_scale, color, 2, cv2.LINE_AA)
+    
+    return frame
+
+
+# --- POSITIONING CALIBRATION LOOP ---
+# Wait for user to position themselves correctly for 2 seconds before starting countdown
+correct_position_start = None
+calibration_complete = False
+
+while cap.isOpened() and not calibration_complete:
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        continue
+
+    frame = cv2.flip(frame, 1)
+    h, w = frame.shape[:2]
+    
+    # Process pose to get landmarks
+    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image.flags.writeable = False
+    results = shared_pose.process(image)
+    image.flags.writeable = True
+    
+    try:
+        landmarks = results.pose_landmarks.landmark
+    except AttributeError:
+        landmarks = None
+    
+    # Check positioning
+    _, status, shoulder_ratio, feedback, color = calibration_checker(frame, landmarks, w, h)
+    
+    # Draw pose landmarks
+    mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+    
+    # Track time in correct position
+    if status == "CORRECT POSITION":
+        if correct_position_start is None:
+            correct_position_start = time.time()
+        
+        time_in_position = time.time() - correct_position_start
+        
+        # Check if user has been in correct position for 2 seconds
+        if time_in_position >= 2.0:
+            calibration_complete = True
+            break
+    else:
+        # Reset timer if not in correct position
+        correct_position_start = None
+        time_in_position = 0
+    
+    # Draw calibration UI
+    display_frame = draw_calibration_frame(frame.copy(), status, shoulder_ratio, feedback, color)
+    
+    # Draw timer if in correct position
+    if correct_position_start is not None:
+        timer_text = f"Get ready: {2.0 - time_in_position:.1f}s"
+        font = cv2.FONT_HERSHEY_DUPLEX
+        timer_size, _ = cv2.getTextSize(timer_text, font, 1.0, 2)
+        timer_x = (w - timer_size[0]) // 2
+        timer_y = h - 50
+        cv2.putText(display_frame, timer_text, (timer_x, timer_y), font, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
+    
+    cv2.imshow(WINDOW_NAME, display_frame)
+    
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        cap.release()
+        cv2.destroyAllWindows()
+        quit()
+
+# --- COUNTDOWN TIMER LOOP ---
 countdown_start = time.time()
 while cap.isOpened():
     ret, frame = cap.read()
@@ -481,11 +637,13 @@ while cap.isOpened():
         
         if TARGET_CENTER is not None and CURRENT_TYPE is not None:
             glove_image = glove_images.get(TARGET_GLOVE_KEY)
-            if CURRENT_TYPE != "jab" and glove_image is not None:
+            if CURRENT_TYPE == "hook":
+                print(f"DEBUG MAIN: Hook detected. CURRENT_TYPE={CURRENT_TYPE}, TARGET_GLOVE_KEY={TARGET_GLOVE_KEY}, glove_image is None: {glove_image is None}")
+            if glove_image is not None:
                 draw_target_glove(image, TARGET_CENTER, TARGET_RADIUS, glove_image, TARGET_GLOVE_KEY)
             else:
-                color = PUNCH_COLORS.get(CURRENT_TYPE, (0, 0, 255))
-                cv2.circle(image, TARGET_CENTER, TARGET_RADIUS, color, -1)
+                if CURRENT_TYPE == "hook":
+                    print(f"DEBUG MAIN: glove_image is None for hook!")
 
         defense_game.update(image, landmarks, now)
 

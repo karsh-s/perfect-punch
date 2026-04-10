@@ -22,10 +22,12 @@ PUNCH_COLORS = {
 
 PUBLIC_ASSET_DIR = Path(__file__).resolve().parents[1] / "public"
 TARGET_GLOVE_ASSETS = {
-    "green_left": "green_left.png",
-    "green_right": "green_right.png",
-    "blue_left": "blue_left.png",
-    "blue_right": "blue_right.png",
+    "green_left": "left_punchpad.png", #left hook
+    "green_right": "right_punchpad.png", #right hook
+    "uppercut_left": "up_punchpad.png", #uppercut
+    "uppercut_right": "up_punchpad.png", #uppercut (same image, rotated in draw function)
+    "jab_left": "front_punchpad.png", #jab
+    "jab_right": "front_punchpad.png", #jab
 }
 
 HAND_CONTACT_LANDMARKS = (
@@ -112,7 +114,11 @@ def choose_punch_type():
 
 def choose_target_glove_key(punch_type=None):
     if punch_type == "jab":
-        return None
+        return random.choice(["jab_left", "jab_right"])
+    if punch_type == "hook":
+        return random.choice(["green_left", "green_right"])
+    if punch_type == "uppercut":
+        return random.choice(["uppercut_left", "uppercut_right"])
     return random.choice(list(TARGET_GLOVE_ASSETS.keys()))
 
 
@@ -123,9 +129,15 @@ def load_target_glove_image(glove_key):
 
     image_path = PUBLIC_ASSET_DIR / filename
     if not image_path.exists():
+        print(f"DEBUG: Image file doesn't exist: {image_path}")
         return None
 
-    return cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+    img = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        print(f"DEBUG: Failed to load image: {image_path}")
+    else:
+        print(f"DEBUG: Successfully loaded {glove_key} -> {filename}, shape: {img.shape}")
+    return img
 
 
 def draw_target_glove(frame, center, radius, glove_image, glove_key=None):
@@ -133,45 +145,68 @@ def draw_target_glove(frame, center, radius, glove_image, glove_key=None):
         return frame
 
     cx, cy = center
-    glove_size = max(int(radius * 10), 1)
-    resized = cv2.resize(glove_image, (glove_size, glove_size), interpolation=cv2.INTER_AREA)
+    # Scale by 0.8x and maintain original aspect ratio
+    base_size = max(int(radius * 10 * 0.8), 1)
+    
+    # Get original image dimensions and aspect ratio
+    img_h, img_w = glove_image.shape[:2]
+    aspect_ratio = img_w / img_h if img_h > 0 else 1.0
+    
+    # Calculate dimensions maintaining aspect ratio
+    if aspect_ratio >= 1.0:
+        # Width is larger or equal
+        new_w = base_size
+        new_h = max(1, int(base_size / aspect_ratio))
+    else:
+        # Height is larger
+        new_h = base_size
+        new_w = max(1, int(base_size * aspect_ratio))
+    
+    resized = cv2.resize(glove_image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    if glove_key is not None and glove_key.startswith("green"):
-        if glove_key.endswith("_right"):
-            resized = cv2.rotate(resized, cv2.ROTATE_90_CLOCKWISE)
-        elif glove_key.endswith("_left"):
-            resized = cv2.rotate(resized, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    # Skip rotation for now - just use as-is
+    # if glove_key is not None and glove_key.startswith("green"):
+    #     if glove_key.endswith("_right"):
+    #         resized = cv2.rotate(resized, cv2.ROTATE_90_CLOCKWISE)
+    #     elif glove_key.endswith("_left"):
+    #         resized = cv2.rotate(resized, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    #     new_h, new_w = resized.shape[:2]
 
-        glove_size = resized.shape[0]
-
-    x1 = cx - glove_size // 2
-    y1 = cy - glove_size // 2
-    x2 = x1 + glove_size
-    y2 = y1 + glove_size
+    resized_h, resized_w = resized.shape[:2]
+    
+    x1 = cx - resized_w // 2
+    y1 = cy - resized_h // 2
+    x2 = x1 + resized_w
+    y2 = y1 + resized_h
 
     frame_h, frame_w = frame.shape[:2]
     src_x1 = max(0, -x1)
     src_y1 = max(0, -y1)
-    src_x2 = glove_size - max(0, x2 - frame_w)
-    src_y2 = glove_size - max(0, y2 - frame_h)
+    src_x2 = resized_w - max(0, x2 - frame_w)
+    src_y2 = resized_h - max(0, y2 - frame_h)
 
     dst_x1 = max(0, x1)
     dst_y1 = max(0, y1)
     dst_x2 = min(frame_w, x2)
     dst_y2 = min(frame_h, y2)
 
-    if dst_x1 >= dst_x2 or dst_y1 >= dst_y2:
+    if dst_x1 >= dst_x2 or dst_y1 >= dst_y2 or src_x1 >= src_x2 or src_y1 >= src_y2:
         return frame
 
     overlay = resized[src_y1:src_y2, src_x1:src_x2]
-    if overlay.shape[2] == 4:
+    if len(overlay.shape) >= 3 and overlay.shape[2] == 4:
+        # Image has alpha channel
         overlay_rgb = overlay[:, :, :3].astype(np.float32)
         alpha = overlay[:, :, 3].astype(np.float32) / 255.0
         alpha = alpha[:, :, np.newaxis]
         base = frame[dst_y1:dst_y2, dst_x1:dst_x2].astype(np.float32)
         blended = overlay_rgb * alpha + base * (1.0 - alpha)
         frame[dst_y1:dst_y2, dst_x1:dst_x2] = blended.astype(np.uint8)
-    else:
+    elif len(overlay.shape) >= 3 and overlay.shape[2] >= 3:
+        # Image has RGB (no alpha)
         frame[dst_y1:dst_y2, dst_x1:dst_x2] = overlay[:, :, :3]
+    else:
+        # Grayscale or other format
+        frame[dst_y1:dst_y2, dst_x1:dst_x2] = overlay
 
     return frame

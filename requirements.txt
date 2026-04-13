@@ -3,7 +3,7 @@ uvicorn
 pydantic
 celery
 redis
-opencv-python
+opencv-python-headless
 mediapipe
 torch
 taipy
@@ -11,3 +11,4 @@ scikit-learn
 python-dotenv
 openai
 numpy
+supabase

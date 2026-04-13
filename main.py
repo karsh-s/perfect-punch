@@ -7,6 +7,8 @@ from pydantic import BaseModel
 import os
 import json
 from dotenv import load_dotenv
+from fastapi.staticfiles import StaticFiles
+from fastapi.response import FileResponse
 
 # Load environment variables from .env file
 load_dotenv()
@@ -181,3 +183,11 @@ async def get_latest_game(user = Depends(get_current_user)):
     except Exception as e:
         print("❌ Error fetching latest session:", e)
         return {"error": "Could not fetch latest session"}
+    
+
+# Serve React build
+app.mount("/assets", StaticFiles(directory="dist/assets"), name="assets")
+
+@app.get("/{full_path:path}")
+async def serve_react(full_path: str):
+    return FileResponse("dist/index.html")

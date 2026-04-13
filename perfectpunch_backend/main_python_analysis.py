@@ -109,7 +109,7 @@ def _load_camera():
 def _load_torch_model():
     """Load PyTorch punch classifier model."""
     model = Model()
-    model.load_state_dict(torch.load("perfectpunch_backend/models/model_state.pt"))
+    model.load_state_dict(torch.load("perfectpunch_backend/models/model_state.pt", map_location='cpu'))
     model.eval()
     return model
 

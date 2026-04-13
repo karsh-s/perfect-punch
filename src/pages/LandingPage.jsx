@@ -170,13 +170,31 @@ const LandingPage = ({ onNavigate, onBackToHome }) => {
         const accuracyPercent = totalPunches > 0 ? Math.round((correctPunches / totalPunches) * 100 * 10) / 10 : 0;
         
         // Convert punch speed from px/s to m/s (assuming ~100 px = 1 meter for gesture tracking)
-        const avgVelocityMs = Math.round((punchSpeed.derived.average / 100) * 100) / 100;
+        // Handle null values gracefully
+        const speedValue = punchSpeed?.derived?.average || 0;
+        const avgVelocityMs = speedValue > 0 ? Math.round((speedValue / 100) * 100) / 100 : 0;
         
         // Get critical prevention from punches_avoided percentage
         const criticalPrevention = defenseMetrics?.punches_avoided?.value ?? 0;
         
         // Get defense breakdown from flying_blocks
         const defenseBreakdown = miscMetrics?.flying_blocks_summary?.values || { blocked: 0, dodged: 0, hit: 0 };
+        
+        // Get reaction time values, handling nulls
+        const reactionTimeBest = reactionTime?.derived?.best || reactionTime?.derived?.average || 250;
+        const reactionTimeJab = reactionTime?.types?.jab || 250;
+        const reactionTimeHook = reactionTime?.types?.hook || 250;
+        const reactionTimeUppercut = reactionTime?.types?.uppercut || 250;
+        
+        // Get punch accuracy values, handling nulls
+        const accuracyJab = punchAccuracy?.types?.jab || 0;
+        const accuracyHook = punchAccuracy?.types?.hook || 0;
+        const accuracyUppercut = punchAccuracy?.types?.uppercut || 0;
+        
+        // Get punch speed values, handling nulls
+        const speedJab = punchSpeed?.types?.jab || 0;
+        const speedHook = punchSpeed?.types?.hook || 0;
+        const speedUppercut = punchSpeed?.types?.uppercut || 0;
 
         const transformed = {
           session_id: session.session_id,
@@ -185,19 +203,27 @@ const LandingPage = ({ onNavigate, onBackToHome }) => {
           summary: {
             score: correctPunches,  // Just the count, not percentage
             avg_velocity: avgVelocityMs,  // in m/s
-            avg_reaction_time: Math.round(reactionTime.derived.best || reactionTime.derived.average),
+            avg_reaction_time: Math.round(reactionTimeBest),
             accuracy: accuracyPercent,  // Overall accuracy percentage
             critical_prevention: criticalPrevention,  // % of punches avoided
             total_punches: totalPunches
           },
-          punch_accuracy: punchAccuracy.types,  // Individual punch type percentages
+          punch_accuracy: {
+            jab: accuracyJab,
+            hook: accuracyHook,
+            uppercut: accuracyUppercut
+          },
           reaction_times: {
-            jab: Math.round(reactionTime.types.jab),
-            hook: Math.round(reactionTime.types.hook),
-            uppercut: Math.round(reactionTime.types.uppercut)
+            jab: Math.round(reactionTimeJab),
+            hook: Math.round(reactionTimeHook),
+            uppercut: Math.round(reactionTimeUppercut)
           },
           defense: defenseBreakdown,  // blocked, dodged, hit counts
-          punch_speed: punchSpeed.types,
+          punch_speed: {
+            jab: speedJab,
+            hook: speedHook,
+            uppercut: speedUppercut
+          },
           timeline: []
         };
         

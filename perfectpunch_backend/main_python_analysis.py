@@ -6,14 +6,15 @@ import ctypes
 import json
 import math
 from datetime import datetime
+import sys
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from extractDataPoints import PoseTracker
-from defense import DefenseGame
-from target_utils import (
+from .extractDataPoints import PoseTracker
+from .defense import DefenseGame
+from .target_utils import (
     respawn_target,
     wrists_hit_circle,
     choose_punch_type,
@@ -96,7 +97,7 @@ class Model(nn.Module):
 # --- Parallel initialization functions ---
 def _load_camera():
     """Initialize camera and warm it up with first frame read."""
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
     # Reduce webcam latency by limiting queued frames and capture size.
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
@@ -130,8 +131,12 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
     model = model_future.result()
     shared_pose = pose_future.result()
 
+if not cap or not cap.isOpened():
+    print("FATAL: Camera failed to initialize. Exiting.")
+    exit(1)
+
 tracker = PoseTracker(max_frames=15, pose=shared_pose)
-glove_images = {key: load_target_glove_image(key) for key in ("green_left", "green_right", "uppercut_left", "uppercut_right", "jab_left", "jab_right")}
+glove_images = {key: load_target_glove_image(key) for key in ("green_left", "green_right", "blue_left", "blue_right")}
 
 TARGET_CENTER = None
 CURRENT_TYPE = None
@@ -289,26 +294,27 @@ WINDOW_NAME = "Mediapipe Feed (Press q to quit)"
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
 cv2.waitKey(1)  # Let the window initialize
 
-# Windows API constants
-GWL_STYLE = -16
-WS_CAPTION = 0x00C00000
-WS_THICKFRAME = 0x00040000
-WS_MINIMIZEBOX = 0x00020000
-WS_MAXIMIZEBOX = 0x00010000
-WS_SYSMENU = 0x00080000
+if sys.platform == "win32":
+    # Windows API constants
+    GWL_STYLE = -16
+    WS_CAPTION = 0x00C00000
+    WS_THICKFRAME = 0x00040000
+    WS_MINIMIZEBOX = 0x00020000
+    WS_MAXIMIZEBOX = 0x00010000
+    WS_SYSMENU = 0x00080000
 
-# Find the window handle and modify its style
-hwnd = ctypes.windll.user32.FindWindowW(None, WINDOW_NAME)
-if hwnd:
-    style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
-    style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)
-    ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
-    # Refresh the window to apply changes
-    SWP_FRAMECHANGED = 0x0020
-    SWP_NOMOVE = 0x0002
-    SWP_NOSIZE = 0x0001
-    SWP_NOZORDER = 0x0004
-    ctypes.windll.user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER)
+    # Find the window handle and modify its style
+    hwnd = ctypes.windll.user32.FindWindowW(None, WINDOW_NAME)
+    if hwnd:
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+        style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+        # Refresh the window to apply changes
+        SWP_FRAMECHANGED = 0x0020
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_NOZORDER = 0x0004
+        ctypes.windll.user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER)
 
 def get_frame():
     ret, frame = cap.read()
@@ -637,13 +643,12 @@ while cap.isOpened():
         
         if TARGET_CENTER is not None and CURRENT_TYPE is not None:
             glove_image = glove_images.get(TARGET_GLOVE_KEY)
-            if CURRENT_TYPE == "hook":
-                print(f"DEBUG MAIN: Hook detected. CURRENT_TYPE={CURRENT_TYPE}, TARGET_GLOVE_KEY={TARGET_GLOVE_KEY}, glove_image is None: {glove_image is None}")
             if glove_image is not None:
                 draw_target_glove(image, TARGET_CENTER, TARGET_RADIUS, glove_image, TARGET_GLOVE_KEY)
             else:
-                if CURRENT_TYPE == "hook":
-                    print(f"DEBUG MAIN: glove_image is None for hook!")
+                # Draw a simple colored circle for jab targets
+                color = PUNCH_COLORS.get(CURRENT_TYPE, (0, 0, 255))
+                cv2.circle(image, TARGET_CENTER, TARGET_RADIUS, color, -1)
 
         defense_game.update(image, landmarks, now)
 
@@ -779,6 +784,8 @@ session_payload = [{
     "fighter_id": fighter_id,
     "session_id": session_id,
     "timestamp": timestamp_iso,
+    "punches_thrown": punches_thrown,
+    "correct_punches": correct_punches_thrown,
     "metrics": {
         "offense": {
             "punch_accuracy": {

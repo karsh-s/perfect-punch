@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
-import os, json, time
+import os, json, time, subprocess
 from datetime import datetime
 
 # Load environment
@@ -57,6 +57,67 @@ def upload_session(payload: dict):
 @app.get("/")
 def root():
     return {"status": "backend running 🚀"}
+
+
+# -----------------------------
+#  RUN PUNCH ANALYSIS ENDPOINT
+# -----------------------------
+@app.post("/analysis/start")
+def start_punch_analysis():
+    """Start the punch analysis camera session."""
+    try:
+        print("🎥 Starting punch analysis...")
+        
+        # Run the main_python_analysis script
+        # Use subprocess to run it as a module within the conda environment
+        result = subprocess.run(
+            ["python", "-m", "perfectpunch_backend.main_python_analysis"],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            capture_output=True,
+            text=True,
+            timeout=120  # 2 minute timeout
+        )
+        
+        # Check if the script ran successfully
+        if result.returncode != 0:
+            print(f"❌ Analysis failed: {result.stderr}")
+            raise HTTPException(status_code=500, detail=f"Analysis failed: {result.stderr}")
+        
+        print("✅ Analysis completed successfully")
+        
+        # Load and return the results from session_metrics.json
+        metrics_file = "session_metrics.json"
+        if os.path.exists(metrics_file):
+            with open(metrics_file, "r") as f:
+                metrics = json.load(f)
+            print(f"📊 Loaded metrics from {metrics_file}")
+            return {"status": "success", "metrics": metrics}
+        else:
+            raise HTTPException(status_code=500, detail="session_metrics.json not found")
+            
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=500, detail="Analysis timeout - took too long")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------------
+#  GET ANALYSIS RESULTS ENDPOINT
+# -----------------------------
+@app.get("/analysis/results")
+def get_analysis_results():
+    """Get the latest punch analysis results from session_metrics.json."""
+    try:
+        metrics_file = "session_metrics.json"
+        if os.path.exists(metrics_file):
+            with open(metrics_file, "r") as f:
+                metrics = json.load(f)
+            return {"status": "success", "metrics": metrics}
+        else:
+            return {"status": "no_data", "metrics": None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # -----------------------------

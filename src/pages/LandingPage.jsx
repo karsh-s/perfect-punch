@@ -1,7 +1,9 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 const LandingPage = ({ onNavigate, onBackToHome }) => {
   const { user } = useAuth();
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [error, setError] = useState(null);
   const fullName = user?.user_metadata?.full_name || 'Fighter';
   const firstName = fullName.split(' ')[0];
   const containerStyle = {
@@ -129,6 +131,92 @@ const LandingPage = ({ onNavigate, onBackToHome }) => {
     e.target.style.boxShadow = '0 4px 16px rgba(0, 0, 0, 0.2)';
   };
 
+  const handleStartAnalysis = async () => {
+    setIsAnalyzing(true);
+    setError(null);
+    try {
+      const response = await fetch('http://localhost:8000/analysis/start', {
+        method: 'POST',
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || 'Analysis failed');
+      }
+
+      const data = await response.json();
+      console.log('Analysis completed:', data);
+      
+      // Transform metrics data into dashboard format
+      const metricsArray = data.metrics || [];
+      console.log('📊 metricsArray:', metricsArray);
+      
+      const transformedMetrics = metricsArray.map(session => {
+        const metrics = session.metrics;
+        const offenseMetrics = metrics.offense;
+        const defenseMetrics = metrics.defense;
+        const miscMetrics = metrics.miscellaneous;
+        
+        // Extract the accuracy data
+        const punchAccuracy = offenseMetrics.punch_accuracy;
+        const reactionTime = offenseMetrics.punch_reaction_time;
+        const punchSpeed = offenseMetrics.punch_speed;
+        
+        // Use the actual punches_thrown count from the session
+        const totalPunches = session.punches_thrown || 0;
+        const correctPunches = session.correct_punches || 0;
+        
+        // Calculate score: (correct_punches / total_punches) * 100
+        const accuracyPercent = totalPunches > 0 ? Math.round((correctPunches / totalPunches) * 100 * 10) / 10 : 0;
+        
+        // Convert punch speed from px/s to m/s (assuming ~100 px = 1 meter for gesture tracking)
+        const avgVelocityMs = Math.round((punchSpeed.derived.average / 100) * 100) / 100;
+        
+        // Get critical prevention from punches_avoided percentage
+        const criticalPrevention = defenseMetrics?.punches_avoided?.value ?? 0;
+        
+        // Get defense breakdown from flying_blocks
+        const defenseBreakdown = miscMetrics?.flying_blocks_summary?.values || { blocked: 0, dodged: 0, hit: 0 };
+
+        const transformed = {
+          session_id: session.session_id,
+          fighter_id: session.fighter_id,
+          timestamp: session.timestamp,
+          summary: {
+            score: correctPunches,  // Just the count, not percentage
+            avg_velocity: avgVelocityMs,  // in m/s
+            avg_reaction_time: Math.round(reactionTime.derived.best || reactionTime.derived.average),
+            accuracy: accuracyPercent,  // Overall accuracy percentage
+            critical_prevention: criticalPrevention,  // % of punches avoided
+            total_punches: totalPunches
+          },
+          punch_accuracy: punchAccuracy.types,  // Individual punch type percentages
+          reaction_times: {
+            jab: Math.round(reactionTime.types.jab),
+            hook: Math.round(reactionTime.types.hook),
+            uppercut: Math.round(reactionTime.types.uppercut)
+          },
+          defense: defenseBreakdown,  // blocked, dodged, hit counts
+          punch_speed: punchSpeed.types,
+          timeline: []
+        };
+        
+        console.log('✅ Transformed single session:', transformed);
+        return transformed;
+      });
+      
+      console.log('✅ All transformedMetrics:', transformedMetrics);
+      
+      // Navigate to dashboard after successful analysis
+      onNavigate('dashboard', transformedMetrics);
+    } catch (err) {
+      console.error('Error starting analysis:', err);
+      setError(err.message || 'Failed to start analysis. Make sure the backend is running.');
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
   return (
     <div style={containerStyle}>
       <div style={backgroundOverlayStyle}></div>
@@ -144,13 +232,23 @@ const LandingPage = ({ onNavigate, onBackToHome }) => {
         <h1 style={greetingStyle}>Welcome back, {firstName}</h1>
         <p style={welcomeStyle}>Ready to analyze your punches?</p>
         <button
-          style={buttonStyle}
-          onClick={onNavigate}
-          onMouseEnter={handleButtonHover}
-          onMouseLeave={handleButtonLeave}
+          style={{
+            ...buttonStyle,
+            opacity: isAnalyzing ? 0.7 : 1,
+            cursor: isAnalyzing ? 'not-allowed' : 'pointer',
+          }}
+          onClick={handleStartAnalysis}
+          onMouseEnter={!isAnalyzing ? handleButtonHover : null}
+          onMouseLeave={!isAnalyzing ? handleButtonLeave : null}
+          disabled={isAnalyzing}
         >
-          Start Punch Analysis
+          {isAnalyzing ? 'Analyzing... (Check Camera Window)' : 'Start Punch Analysis'}
         </button>
+        {error && (
+          <p style={{ color: '#ff6b6b', marginTop: '20px', fontSize: '0.95rem', textAlign: 'center' }}>
+            ❌ {error}
+          </p>
+        )}
       </div>
     </div>
   );

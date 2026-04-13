@@ -12,6 +12,7 @@ function AppContent() {
   const { user, loading } = useAuth() 
   const [currentPage, setCurrentPage] = useState('home')
   const [currentSessionId, setCurrentSessionId] = useState(null)
+  const [analysisMetrics, setAnalysisMetrics] = useState(null)
 
 
   // navigation helpers
@@ -35,8 +36,15 @@ function AppContent() {
     setCurrentPage('login')
   }
 
-  const handleStartAnalysis = () => {
-    setCurrentPage('camera')
+  const handleStartAnalysis = (page, metricsData = null) => {
+    // If called with 'dashboard', go directly to dashboard with metrics
+    if (page === 'dashboard') {
+      setAnalysisMetrics(metricsData)
+      setCurrentPage('dashboard')
+    } else {
+      // Otherwise go to camera page (for old flow)
+      setCurrentPage('camera')
+    }
   }
 
   const backToLanding = () => {
@@ -104,7 +112,7 @@ function AppContent() {
       )}
 
       {currentPage === 'dashboard' && (
-        <DashboardPage onNavigate={backToLanding} sessionId={currentSessionId} />
+        <DashboardPage onNavigate={backToLanding} sessionId={currentSessionId} metricsData={analysisMetrics} />
       )}
     </div>
   )

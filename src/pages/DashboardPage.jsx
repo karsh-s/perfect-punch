@@ -15,20 +15,41 @@ import {
   ResponsiveContainer,
 } from "recharts";
 
-const DashboardPage = ({ onNavigate, sessionId = null }) => {
+const DashboardPage = ({ onNavigate, sessionId = null, metricsData = null }) => {
   const [sessionData, setSessionData] = useState(null);
   const [loading, setLoading] = useState(true);
 
   // ---------------------------------------------------------
-  // 🚀 FETCH REAL SESSION DATA (LOCALSTORAGE FIRST, THEN API)
+  // 🚀 FETCH REAL SESSION DATA (METRICS FIRST, THEN LOCALSTORAGE, THEN API)
   // ---------------------------------------------------------
   useEffect(() => {
     setLoading(true);
 
     async function fetchData() {
-      console.log("🔍 Fetching session data...", { sessionId });
+      console.log("🔍 Fetching session data...", { sessionId, metricsData });
 
-      // 1️⃣ FIRST: Try loading from localStorage (for demo sessions)
+      // 0️⃣ FIRST: Check if metrics were passed directly from analysis
+      if (metricsData) {
+        try {
+          console.log("✅ Using metrics data from analysis:", metricsData);
+          // The metrics data from the analysis is already transformed
+          const metrics = Array.isArray(metricsData) ? metricsData[0] : metricsData;
+          console.log("📊 Transformed metrics structure:", {
+            hasSession: !!metrics.session_id,
+            hasSummary: !!metrics.summary,
+            hasPunchAccuracy: !!metrics.punch_accuracy,
+            hasReactionTimes: !!metrics.reaction_times,
+            hasDefense: !!metrics.defense
+          });
+          setSessionData(metrics);
+          setLoading(false);
+          return;
+        } catch (err) {
+          console.error("❌ Error processing metrics data:", err);
+        }
+      }
+
+      // 1️⃣ THEN: Try loading from localStorage (for demo sessions)
       if (sessionId && sessionId.startsWith('demo-')) {
         try {
           const storedKey = `demo_session_${sessionId}`;
@@ -216,6 +237,11 @@ const DashboardPage = ({ onNavigate, sessionId = null }) => {
   // ---------------------------------------------------------
   // 📊 CHART DATA PREP (with safety checks)
   // ---------------------------------------------------------
+  console.log("🎯 DashboardPage rendering with sessionData:", sessionData);
+  console.log("📊 sessionData.punch_accuracy:", sessionData?.punch_accuracy);
+  console.log("📊 sessionData.reaction_times:", sessionData?.reaction_times);
+  console.log("📊 sessionData.defense:", sessionData?.defense);
+  
   const punchAccuracy = sessionData.punch_accuracy || { jab: 0, hook: 0, uppercut: 0 };
   const punchAccuracyData = [
     { name: "Jab", value: punchAccuracy.jab || 0 },
@@ -256,9 +282,9 @@ const DashboardPage = ({ onNavigate, sessionId = null }) => {
       ];
 
   // Calculate derived metrics from actual recorded data
-  const avgVelocityMph = (sessionData.summary?.avg_velocity ?? 0) * 2.237; // Convert m/s to mph
+  const avgVelocityMs = sessionData.summary?.avg_velocity ?? 0; // Already in m/s
   const totalPunches = sessionData.summary?.total_punches ?? 0;
-  const sessionScore = sessionData.summary?.score ?? 0;
+  const sessionScore = sessionData.summary?.score ?? 0;  // Correct punch count
 
   // Format session date/time for display
   const formatSessionDate = (timestamp) => {
@@ -423,7 +449,7 @@ const DashboardPage = ({ onNavigate, sessionId = null }) => {
             </h2>
           </div>
           <p style={{ fontSize: '1.875rem', fontWeight: '800', color: "#ff6b6b" }}>
-            {avgVelocityMph.toFixed(1)} mph
+            {avgVelocityMs.toFixed(1)} m/s
           </p>
         </div>
 

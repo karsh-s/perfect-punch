@@ -4,7 +4,9 @@ import numpy as np
 import threading
 import time
 
+import mediapipe as mp
 mp_pose = mp.solutions.pose
+
 
 class PoseTracker:
     def __init__(self, max_frames=15, pose=None):

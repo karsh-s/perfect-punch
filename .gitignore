@@ -1,3 +1,9 @@
+# Large files
+*.sh
+Miniconda*.sh
+*.exe
+*.iso
+
 # Logs
 logs
 *.log
@@ -45,14 +51,15 @@ coverage
 # Python virtual environment
 venv/
 .venv/
+perfect-punch-env/
+ENTER/
 env/
-ENV/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.egg-info/
-build/
-dist/
 .Python
 *.so
+*.egg-info/
+dist/
+build/

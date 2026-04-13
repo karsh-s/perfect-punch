@@ -6,19 +6,121 @@ from typing import Dict, List, Optional, Tuple
 import os
 
 
-class PunchClassifierModel(nn.Module):
-    """PyTorch neural network model for punch classification."""
+class SpatialConvBlock(nn.Module):
+    """Spatial convolution block for 2D spatial features."""
+    def __init__(self, in_channels, out_channels):
+        super(SpatialConvBlock, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=(1, 3, 3), padding=(0, 1, 1))
+        self.bn = nn.BatchNorm3d(out_channels)
     
-    def __init__(self, in_features=120, h1=128, h2=64, out_features=3):
-        super(PunchClassifierModel, self).__init__()
-        self.fc1 = nn.Linear(in_features, h1)
-        self.fc2 = nn.Linear(h1, h2)
-        self.out = nn.Linear(h2, out_features)
-
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.out(x)
+        x = self.conv(x)
+        x = self.bn(x)
+        x = F.relu(x)
+        return x
+
+
+class TemporalConvBlock(nn.Module):
+    """Temporal convolution block for temporal features."""
+    def __init__(self, in_channels, out_channels):
+        super(TemporalConvBlock, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=(3, 1, 1), padding=(1, 0, 0))
+        self.bn = nn.BatchNorm3d(out_channels)
+    
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = F.relu(x)
+        return x
+
+
+class ResidualBlock(nn.Module):
+    """Residual block with 1x1x1 convolution."""
+    def __init__(self, in_channels, out_channels):
+        super(ResidualBlock, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=(1, 1, 1))
+        self.bn = nn.BatchNorm3d(out_channels)
+    
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = F.relu(x)
+        return x
+
+
+class ConvLayer(nn.Module):
+    """Residual layer with spatial, temporal, and residual branches."""
+    def __init__(self, in_channels, spatial_out, temporal_out, residual_out):
+        super(ConvLayer, self).__init__()
+        self.spatial = SpatialConvBlock(in_channels, spatial_out)
+        self.temporal = TemporalConvBlock(spatial_out, temporal_out)
+        self.residual = ResidualBlock(in_channels, residual_out)
+    
+    def forward(self, x):
+        spatial = self.spatial(x)
+        temporal = self.temporal(spatial)
+        residual = self.residual(x)
+        # Residual connection: add residual branch to temporal output
+        out = temporal + residual
+        return out
+
+
+class PunchClassifierModel(nn.Module):
+    """3D CNN model for punch classification using spatial and temporal features."""
+    
+    def __init__(self, num_classes=3):
+        super(PunchClassifierModel, self).__init__()
+        
+        # Stem layer: Initial 3D convolution
+        self.stem = nn.Sequential(
+            nn.Conv3d(1, 32, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Residual layers with spatial, temporal, and residual connections
+        self.layer1 = ConvLayer(32, 32, 64, 64)    # 32 -> 64
+        self.layer2 = ConvLayer(64, 64, 128, 128)  # 64 -> 128
+        self.layer3 = ConvLayer(128, 128, 256, 256)  # 128 -> 256
+        self.layer4 = ConvLayer(256, 256, 256, 256)  # 256 -> 256 (no residual expansion)
+        self.layer5 = ConvLayer(256, 256, 512, 512)  # 256 -> 512
+        self.layer6 = ConvLayer(512, 512, 512, 512)  # 512 -> 512 (no residual expansion)
+        
+        # Global average pooling
+        self.avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        
+        # Classifier head
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, num_classes)
+        )
+    
+    def forward(self, x):
+        # x shape: (batch, channels, depth, height, width)
+        # If input is 2D features (batch, features), reshape to (batch, 1, frames, 1, 1)
+        if x.dim() == 2:
+            # Reshape features to 3D volume
+            batch_size = x.shape[0]
+            # Assuming 120 features = 15 frames * 8 landmarks * (x,y)
+            # Reshape to (batch, 1, 15, 8, 1) for 3D conv
+            x = x.view(batch_size, 1, 15, 8, 1)
+        
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.layer5(x)
+        x = self.layer6(x)
+        
+        x = self.avg_pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        
         return x
 
 

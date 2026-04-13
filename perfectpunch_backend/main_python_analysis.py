@@ -81,16 +81,171 @@ def _flatten_normalized_features(coords):
     return features
 
 class Model(nn.Module):
-    def __init__(self, in_features=120, h1=128, h2=64, out_features=3):
+    """3D CNN model for punch classification with spatial, temporal, and residual branches."""
+    
+    def __init__(self, num_classes=3):
         super(Model, self).__init__()
-        self.fc1 = nn.Linear(in_features, h1)
-        self.fc2 = nn.Linear(h1, h2)
-        self.out = nn.Linear(h2, out_features)
-
+        
+        # Stem layer: Initial 3D convolution (7 input channels for pose landmarks)
+        self.stem = nn.Sequential(
+            nn.Conv3d(7, 32, kernel_size=(3, 3, 3), padding=(1, 1, 1), bias=False),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Layer 1: in=32, spatial_out=32, temporal_out=64, residual_out=64
+        self.layer1 = nn.ModuleDict({
+            'spatial': nn.Sequential(
+                nn.Conv3d(32, 32, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
+                nn.BatchNorm3d(32),
+            ),
+            'temporal': nn.Sequential(
+                nn.Conv3d(32, 64, kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=False),
+                nn.BatchNorm3d(64),
+            ),
+            'residual': nn.Sequential(
+                nn.Conv3d(32, 64, kernel_size=(1, 1, 1), bias=False),
+                nn.BatchNorm3d(64),
+            )
+        })
+        
+        # Layer 2: in=64, spatial_out=64, temporal_out=128, residual_out=128
+        self.layer2 = nn.ModuleDict({
+            'spatial': nn.Sequential(
+                nn.Conv3d(64, 64, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
+                nn.BatchNorm3d(64),
+            ),
+            'temporal': nn.Sequential(
+                nn.Conv3d(64, 128, kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=False),
+                nn.BatchNorm3d(128),
+            ),
+            'residual': nn.Sequential(
+                nn.Conv3d(64, 128, kernel_size=(1, 1, 1), bias=False),
+                nn.BatchNorm3d(128),
+            )
+        })
+        
+        # Layer 3: in=128, spatial_out=128, temporal_out=256, residual_out=256
+        self.layer3 = nn.ModuleDict({
+            'spatial': nn.Sequential(
+                nn.Conv3d(128, 128, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
+                nn.BatchNorm3d(128),
+            ),
+            'temporal': nn.Sequential(
+                nn.Conv3d(128, 256, kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=False),
+                nn.BatchNorm3d(256),
+            ),
+            'residual': nn.Sequential(
+                nn.Conv3d(128, 256, kernel_size=(1, 1, 1), bias=False),
+                nn.BatchNorm3d(256),
+            )
+        })
+        
+        # Layer 4: in=256, spatial_out=256, temporal_out=256, no residual
+        self.layer4 = nn.ModuleDict({
+            'spatial': nn.Sequential(
+                nn.Conv3d(256, 256, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
+                nn.BatchNorm3d(256),
+            ),
+            'temporal': nn.Sequential(
+                nn.Conv3d(256, 256, kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=False),
+                nn.BatchNorm3d(256),
+            )
+        })
+        
+        # Layer 5: in=256, spatial_out=256, temporal_out=512, residual_out=512
+        self.layer5 = nn.ModuleDict({
+            'spatial': nn.Sequential(
+                nn.Conv3d(256, 256, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
+                nn.BatchNorm3d(256),
+            ),
+            'temporal': nn.Sequential(
+                nn.Conv3d(256, 512, kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=False),
+                nn.BatchNorm3d(512),
+            ),
+            'residual': nn.Sequential(
+                nn.Conv3d(256, 512, kernel_size=(1, 1, 1), bias=False),
+                nn.BatchNorm3d(512),
+            )
+        })
+        
+        # Layer 6: in=512, spatial_out=512, temporal_out=512, no residual
+        self.layer6 = nn.ModuleDict({
+            'spatial': nn.Sequential(
+                nn.Conv3d(512, 512, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
+                nn.BatchNorm3d(512),
+            ),
+            'temporal': nn.Sequential(
+                nn.Conv3d(512, 512, kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=False),
+                nn.BatchNorm3d(512),
+            )
+        })
+        
+        # Global average pooling
+        self.avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        
+        # Classifier head matches saved model structure
+        # Saved model has keys: classifier.2 (Linear 512->256), classifier.5 (Linear 256->3)
+        # So we use placeholder modules for indices 0,1,3,4 to match saved weights at 2 and 5
+        self.classifier = nn.Sequential(
+            nn.Identity(),  # classifier.0
+            nn.Identity(),  # classifier.1
+            nn.Linear(512, 256),  # classifier.2: takes pooled output (512 channels)
+            nn.ReLU(inplace=True),  # classifier.3
+            nn.Identity(),  # classifier.4 (could be Dropout)
+            nn.Linear(256, num_classes)  # classifier.5: outputs num_classes (3)
+        )
+    
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.out(x)
+        # x shape: (batch, channels, depth, height, width)
+        # If input is 2D features (batch, features), reshape appropriately
+        if x.dim() == 2:
+            batch_size = x.shape[0]
+            # Reshape 120 features to (batch, 7, 15, 8, 1) for 3D conv input
+            # Expands 120 features across 7 channels: 120/7 ≈ 17.14, but view as (7, 15, 8) works
+            x = x.unsqueeze(1).expand(-1, 7, -1)  # (batch, 7, 120)
+            x = x.view(batch_size, 7, 15, 8, 1)   # (batch, 7, 15, 8, 1)
+        
+        x = self.stem(x)
+        
+        # Layer 1
+        spatial = F.relu(self.layer1['spatial'](x))
+        temporal = F.relu(self.layer1['temporal'](spatial))
+        residual = F.relu(self.layer1['residual'](x))
+        x = temporal + residual
+        
+        # Layer 2
+        spatial = F.relu(self.layer2['spatial'](x))
+        temporal = F.relu(self.layer2['temporal'](spatial))
+        residual = F.relu(self.layer2['residual'](x))
+        x = temporal + residual
+        
+        # Layer 3
+        spatial = F.relu(self.layer3['spatial'](x))
+        temporal = F.relu(self.layer3['temporal'](spatial))
+        residual = F.relu(self.layer3['residual'](x))
+        x = temporal + residual
+        
+        # Layer 4: no residual connection
+        spatial = F.relu(self.layer4['spatial'](x))
+        temporal = F.relu(self.layer4['temporal'](spatial))
+        x = temporal
+        
+        # Layer 5
+        spatial = F.relu(self.layer5['spatial'](x))
+        temporal = F.relu(self.layer5['temporal'](spatial))
+        residual = F.relu(self.layer5['residual'](x))
+        x = temporal + residual
+        
+        # Layer 6: no residual connection
+        spatial = F.relu(self.layer6['spatial'](x))
+        temporal = F.relu(self.layer6['temporal'](spatial))
+        x = temporal
+        
+        x = self.avg_pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        
         return x
 
 

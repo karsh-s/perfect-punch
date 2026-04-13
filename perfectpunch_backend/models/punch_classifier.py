@@ -6,46 +6,34 @@ from typing import Dict, List, Optional, Tuple
 import os
 
 
-class SpatialConvBlock(nn.Module):
+class SpatialConvBlock(nn.Sequential):
     """Spatial convolution block for 2D spatial features."""
     def __init__(self, in_channels, out_channels):
-        super(SpatialConvBlock, self).__init__()
-        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=(1, 3, 3), padding=(0, 1, 1))
-        self.bn = nn.BatchNorm3d(out_channels)
-    
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        x = F.relu(x)
-        return x
+        super(SpatialConvBlock, self).__init__(
+            nn.Conv3d(in_channels, out_channels, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True)
+        )
 
 
-class TemporalConvBlock(nn.Module):
+class TemporalConvBlock(nn.Sequential):
     """Temporal convolution block for temporal features."""
     def __init__(self, in_channels, out_channels):
-        super(TemporalConvBlock, self).__init__()
-        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=(3, 1, 1), padding=(1, 0, 0))
-        self.bn = nn.BatchNorm3d(out_channels)
-    
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        x = F.relu(x)
-        return x
+        super(TemporalConvBlock, self).__init__(
+            nn.Conv3d(in_channels, out_channels, kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=False),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True)
+        )
 
 
-class ResidualBlock(nn.Module):
+class ResidualBlock(nn.Sequential):
     """Residual block with 1x1x1 convolution."""
     def __init__(self, in_channels, out_channels):
-        super(ResidualBlock, self).__init__()
-        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=(1, 1, 1))
-        self.bn = nn.BatchNorm3d(out_channels)
-    
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        x = F.relu(x)
-        return x
+        super(ResidualBlock, self).__init__(
+            nn.Conv3d(in_channels, out_channels, kernel_size=(1, 1, 1), bias=False),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True)
+        )
 
 
 class ConvLayer(nn.Module):
@@ -65,15 +53,28 @@ class ConvLayer(nn.Module):
         return out
 
 
+class SimpleConvLayer(nn.Module):
+    """Simple layer with spatial and temporal branches (no residual)."""
+    def __init__(self, in_channels, spatial_out, temporal_out):
+        super(SimpleConvLayer, self).__init__()
+        self.spatial = SpatialConvBlock(in_channels, spatial_out)
+        self.temporal = TemporalConvBlock(spatial_out, temporal_out)
+    
+    def forward(self, x):
+        spatial = self.spatial(x)
+        temporal = self.temporal(spatial)
+        return temporal
+
+
 class PunchClassifierModel(nn.Module):
     """3D CNN model for punch classification using spatial and temporal features."""
     
     def __init__(self, num_classes=3):
         super(PunchClassifierModel, self).__init__()
         
-        # Stem layer: Initial 3D convolution
+        # Stem layer: Initial 3D convolution (expects 7 input channels)
         self.stem = nn.Sequential(
-            nn.Conv3d(1, 32, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
+            nn.Conv3d(7, 32, kernel_size=(3, 3, 3), padding=(1, 1, 1), bias=False),
             nn.BatchNorm3d(32),
             nn.ReLU(inplace=True)
         )
@@ -82,21 +83,21 @@ class PunchClassifierModel(nn.Module):
         self.layer1 = ConvLayer(32, 32, 64, 64)    # 32 -> 64
         self.layer2 = ConvLayer(64, 64, 128, 128)  # 64 -> 128
         self.layer3 = ConvLayer(128, 128, 256, 256)  # 128 -> 256
-        self.layer4 = ConvLayer(256, 256, 256, 256)  # 256 -> 256 (no residual expansion)
+        self.layer4 = SimpleConvLayer(256, 256, 256)  # 256 -> 256 (no residual)
         self.layer5 = ConvLayer(256, 256, 512, 512)  # 256 -> 512
-        self.layer6 = ConvLayer(512, 512, 512, 512)  # 512 -> 512 (no residual expansion)
+        self.layer6 = SimpleConvLayer(512, 512, 512)  # 512 -> 512 (no residual)
         
         # Global average pooling
         self.avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
         
         # Classifier head
         self.classifier = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, num_classes)
+            nn.Identity(),                  # Index 0 (placeholder, no weights)
+            nn.Identity(),                  # Index 1 (placeholder, no weights)
+            nn.Linear(512, 256),            # Index 2 (checkpoint)
+            nn.ReLU(inplace=True),          # Index 3
+            nn.Dropout(0.5),                # Index 4
+            nn.Linear(256, num_classes)     # Index 5 (checkpoint)
         )
     
     def forward(self, x):

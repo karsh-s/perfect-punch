@@ -7,6 +7,7 @@ import json
 import math
 from datetime import datetime
 import sys
+import os
 
 import torch
 import torch.nn as nn
@@ -24,8 +25,31 @@ from .target_utils import (
     load_target_glove_image,
 )
 
+# Flag to disable display for headless/backend environments
+SHOW_DISPLAY = os.getenv('SHOW_DISPLAY', 'false').lower() == 'true'
+
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
+
+
+def show_frame(window_name, frame):
+    """Display frame only if display is enabled."""
+    if SHOW_DISPLAY:
+        try:
+            cv2.imshow(window_name, frame)
+        except Exception as e:
+            print(f"Warning: Could not display frame: {e}")
+
+
+def wait_key(delay=1):
+    """Wait for key input only if display is enabled. Returns quit flag."""
+    if SHOW_DISPLAY:
+        try:
+            if cv2.waitKey(delay) & 0xFF == ord('q'):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def _get_time_window_index(elapsed_seconds):
@@ -446,8 +470,9 @@ def update_coverage_metrics(landmarks, w, h):
 
 # Create window and remove decorations (title bar, buttons) to make it non-movable
 WINDOW_NAME = "Mediapipe Feed (Press q to quit)"
-cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
-cv2.waitKey(1)  # Let the window initialize
+if SHOW_DISPLAY:
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+    cv2.waitKey(1)  # Let the window initialize
 
 if sys.platform == "win32":
     # Windows API constants
@@ -669,9 +694,9 @@ while cap.isOpened() and not calibration_complete:
         timer_y = h - 50
         cv2.putText(display_frame, timer_text, (timer_x, timer_y), font, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
     
-    cv2.imshow(WINDOW_NAME, display_frame)
+    show_frame(WINDOW_NAME, display_frame)
     
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    if wait_key(1):
         cap.release()
         cv2.destroyAllWindows()
         quit()
@@ -690,9 +715,9 @@ while cap.isOpened():
         break
 
     countdown_frame = render_countdown_frame(cv2.flip(frame, 1), remaining)
-    cv2.imshow(WINDOW_NAME, countdown_frame)
+    show_frame(WINDOW_NAME, countdown_frame)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    if wait_key(1):
         cap.release()
         cv2.destroyAllWindows()
         quit()
@@ -808,9 +833,9 @@ while cap.isOpened():
         defense_game.update(image, landmarks, now)
 
         display_image = cv2.flip(image, 1)
-        cv2.imshow(WINDOW_NAME, display_image)
+        show_frame(WINDOW_NAME, display_image)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        if wait_key(1):
             break
         if elapsed >= MAX_RUNTIME:
             break

@@ -70,18 +70,22 @@ def start_punch_analysis():
         
         # Run the main_python_analysis script
         # Use subprocess to run it as a module within the conda environment
+        # Set SHOW_DISPLAY=true to enable camera window
+        env = os.environ.copy()
+        env['SHOW_DISPLAY'] = 'true'
+        
         result = subprocess.run(
             ["python", "-m", "perfectpunch_backend.main_python_analysis"],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            capture_output=True,
-            text=True,
-            timeout=120  # 2 minute timeout
+            # Don't capture output so camera window can display
+            timeout=120,  # 2 minute timeout
+            env=env  # Pass the environment with SHOW_DISPLAY=true
         )
         
         # Check if the script ran successfully
         if result.returncode != 0:
-            print(f"❌ Analysis failed: {result.stderr}")
-            raise HTTPException(status_code=500, detail=f"Analysis failed: {result.stderr}")
+            print(f"❌ Analysis failed with return code {result.returncode}")
+            raise HTTPException(status_code=500, detail=f"Analysis failed with return code {result.returncode}")
         
         print("✅ Analysis completed successfully")
         

@@ -1,9 +1,9 @@
 [
   {
     "fighter_id": "fighter_sample_001",
-    "session_id": "session_20260413_235702",
-    "timestamp": "2026-04-13T23:57:02Z",
-    "punches_thrown": 4,
+    "session_id": "session_20260415_162809",
+    "timestamp": "2026-04-15T16:28:09Z",
+    "punches_thrown": 6,
     "correct_punches": 0,
     "metrics": {
       "offense": {
@@ -21,27 +21,27 @@
             "worst": 0.0,
             "all_points": [
               0.0,
-              null,
-              0.0
+              0.0,
+              null
             ]
           }
         },
         "punch_reaction_time": {
           "unit": "ms",
           "types": {
-            "jab": 6503.21,
-            "hook": 1767.31,
+            "jab": 1291.41,
+            "hook": 1905.66,
             "uppercut": null
           },
           "derived": {
-            "average": 5319.24,
+            "average": 1466.91,
             "average_description": "Average reaction time, in milliseconds, measured across all punches.",
-            "best": 1067.2,
-            "worst": 17308.79,
+            "best": 1036.2,
+            "worst": 2640.65,
             "all_points": [
-              1322.72,
-              null,
-              17308.79
+              1530.82,
+              1083.49,
+              null
             ],
             "all_points_description": "Reaction time averages for each 10-second segment of the session."
           }
@@ -49,26 +49,26 @@
         "punch_speed": {
           "unit": "px/s",
           "types": {
-            "jab": 2746.29,
-            "hook": 771.41,
+            "jab": 3607.62,
+            "hook": 4166.93,
             "uppercut": null
           },
           "derived": {
-            "average": 2252.57,
+            "average": 3767.42,
             "average_description": "Mean punch speed across all punch types during the session.",
-            "best": 3680.07,
-            "worst": 771.41,
+            "best": 5002.13,
+            "worst": 1151.4,
             "all_points": [
-              1918.36,
-              null,
-              3255.2
+              3893.55,
+              3010.65,
+              null
             ],
             "combo_tempo": {
               "unit": "px/s",
               "segments": {
-                "first_third": 1918.36,
-                "second_third": null,
-                "final_third": 3255.2
+                "first_third": 3893.55,
+                "second_third": 3010.65,
+                "final_third": null
               },
               "description": "Average punch speed per 10-second segment of the session."
             }
@@ -99,13 +99,13 @@
           "description": "Average accuracy over each third of the session, representing endurance and fatigue levels.",
           "segments": {
             "first_third": 0.0,
-            "second_third": null,
-            "final_third": 0.0
+            "second_third": 0.0,
+            "final_third": null
           }
         },
         "punches_avoided": {
           "unit": "%",
-          "value": 60.0,
+          "value": 100.0,
           "description": "Percentage of incoming targets that were blocked or dodged."
         }
       },
@@ -113,9 +113,9 @@
         "flying_blocks_summary": {
           "unit": "count",
           "values": {
-            "blocked": 0,
-            "dodged": 3,
-            "hit": 2
+            "blocked": 2,
+            "dodged": 0,
+            "hit": 0
           },
           "description": "Counts of block, dodge, and hit outcomes from the flying blocks drill."
         }

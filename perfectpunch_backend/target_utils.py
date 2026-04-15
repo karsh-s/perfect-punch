@@ -22,10 +22,10 @@ PUNCH_COLORS = {
 
 PUBLIC_ASSET_DIR = Path(__file__).resolve().parents[1] / "public"
 TARGET_GLOVE_ASSETS = {
-    "green_left": "green_left.png",
-    "green_right": "green_right.png",
-    "blue_left": "blue_left.png",
-    "blue_right": "blue_right.png",
+    "jab_front": "front_punchpad.png",
+    "hook_left": "left_punchpad.png",
+    "hook_right": "right_punchpad.png",
+    "uppercut_up": "up_punchpad.png",
 }
 
 HAND_CONTACT_LANDMARKS = (
@@ -112,17 +112,17 @@ def choose_punch_type():
 
 def choose_target_glove_key(punch_type=None):
     """
-    Choose a glove image key based on punch type.
-    - jab: no glove (returns None)
-    - hook: green glove
-    - uppercut: blue glove
+    Choose a punchpad image key based on punch type.
+    - jab: front punchpad
+    - hook: randomly left or right punchpad
+    - uppercut: up punchpad
     """
     if punch_type == "jab":
-        return None
+        return "jab_front"
     elif punch_type == "hook":
-        return random.choice(["green_left", "green_right"])
+        return random.choice(["hook_left", "hook_right"])
     elif punch_type == "uppercut":
-        return random.choice(["blue_left", "blue_right"])
+        return "uppercut_up"
     else:
         # Fallback
         return random.choice(list(TARGET_GLOVE_ASSETS.keys()))
@@ -148,13 +148,7 @@ def draw_target_glove(frame, center, radius, glove_image, glove_key=None):
     glove_size = max(int(radius * 10), 1)
     resized = cv2.resize(glove_image, (glove_size, glove_size), interpolation=cv2.INTER_AREA)
 
-    if glove_key is not None and glove_key.startswith("green"):
-        if glove_key.endswith("_right"):
-            resized = cv2.rotate(resized, cv2.ROTATE_90_CLOCKWISE)
-        elif glove_key.endswith("_left"):
-            resized = cv2.rotate(resized, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-        glove_size = resized.shape[0]
+    glove_size = resized.shape[0]
 
     x1 = cx - glove_size // 2
     y1 = cy - glove_size // 2

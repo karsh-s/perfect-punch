@@ -13,20 +13,39 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .extractDataPoints import PoseTracker
-from .defense import DefenseGame
-from .target_utils import (
-    respawn_target,
-    wrists_hit_circle,
-    choose_punch_type,
-    PUNCH_COLORS,
-    choose_target_glove_key,
-    draw_target_glove,
-    load_target_glove_image,
-)
+try:
+    from .extractDataPoints import PoseTracker
+    from .defense import DefenseGame
+    from .target_utils import (
+        respawn_target,
+        wrists_hit_circle,
+        choose_punch_type,
+        PUNCH_COLORS,
+        choose_target_glove_key,
+        draw_target_glove,
+        load_target_glove_image,
+    )
+except ImportError:
+    # Fallback for direct script execution (no package context).
+    from extractDataPoints import PoseTracker
+    from defense import DefenseGame
+    from target_utils import (
+        respawn_target,
+        wrists_hit_circle,
+        choose_punch_type,
+        PUNCH_COLORS,
+        choose_target_glove_key,
+        draw_target_glove,
+        load_target_glove_image,
+    )
 
 # Flag to disable display for headless/backend environments
 SHOW_DISPLAY = os.getenv('SHOW_DISPLAY', 'false').lower() == 'true'
+MODEL_SEQUENCE_FRAMES = 50
+LANDMARK_FEATURES_PER_FRAME = 8
+MODEL_CONF_THRESHOLD = 0.55
+CLASS_NAMES = ("hook", "jab", "uppercut")
+FEATURE_LANDMARK_ORDER = ("RIGHT_ELBOW", "RIGHT_WRIST", "LEFT_ELBOW", "LEFT_WRIST")
 
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
@@ -99,9 +118,17 @@ def _compute_speed_value(raw_coords, fps_value):
 def _flatten_normalized_features(coords):
     features = []
     for record in coords:
-        if record["landmarks"]:
-            for key in record["landmarks"].values():
-                features.extend([key["x"], key["y"]])
+        landmarks = record.get("landmarks")
+        if not landmarks:
+            continue
+
+        # Preserve a fixed landmark order so model inputs match training layout.
+        if any(name not in landmarks for name in FEATURE_LANDMARK_ORDER):
+            continue
+
+        for landmark_name in FEATURE_LANDMARK_ORDER:
+            point = landmarks[landmark_name]
+            features.extend([point["x"], point["y"]])
     return features
 
 class Model(nn.Module):
@@ -225,10 +252,15 @@ class Model(nn.Module):
         # If input is 2D features (batch, features), reshape appropriately
         if x.dim() == 2:
             batch_size = x.shape[0]
-            # Reshape 120 features to (batch, 7, 15, 8, 1) for 3D conv input
-            # Expands 120 features across 7 channels: 120/7 ≈ 17.14, but view as (7, 15, 8) works
+            feature_count = x.shape[1]
+            if feature_count % LANDMARK_FEATURES_PER_FRAME != 0:
+                raise ValueError(
+                    f"Expected feature count divisible by {LANDMARK_FEATURES_PER_FRAME}, got {feature_count}"
+                )
+
+            sequence_len = feature_count // LANDMARK_FEATURES_PER_FRAME
             x = x.unsqueeze(1).expand(-1, 7, -1)  # (batch, 7, 120)
-            x = x.view(batch_size, 7, 15, 8, 1)   # (batch, 7, 15, 8, 1)
+            x = x.view(batch_size, 7, sequence_len, LANDMARK_FEATURES_PER_FRAME, 1)
         
         x = self.stem(x)
         
@@ -274,16 +306,57 @@ class Model(nn.Module):
 
 
 # --- Parallel initialization functions ---
+def _camera_backend_candidates():
+    if sys.platform == "win32":
+        return [
+            getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY),
+            getattr(cv2, "CAP_MSMF", cv2.CAP_ANY),
+            cv2.CAP_ANY,
+        ]
+    if sys.platform == "darwin":
+        return [
+            getattr(cv2, "CAP_AVFOUNDATION", cv2.CAP_ANY),
+            cv2.CAP_ANY,
+        ]
+    return [
+        getattr(cv2, "CAP_V4L2", cv2.CAP_ANY),
+        cv2.CAP_ANY,
+    ]
+
+
 def _load_camera():
     """Initialize camera and warm it up with first frame read."""
-    cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
-    # Reduce webcam latency by limiting queued frames and capture size.
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    cap.read()  # Warm up - first read is slower
-    return cap
+    attempted = set()
+    backend_names = {
+        getattr(cv2, "CAP_DSHOW", -1): "CAP_DSHOW",
+        getattr(cv2, "CAP_MSMF", -1): "CAP_MSMF",
+        getattr(cv2, "CAP_AVFOUNDATION", -1): "CAP_AVFOUNDATION",
+        getattr(cv2, "CAP_V4L2", -1): "CAP_V4L2",
+        cv2.CAP_ANY: "CAP_ANY",
+    }
+
+    for backend in _camera_backend_candidates():
+        if backend in attempted:
+            continue
+        attempted.add(backend)
+
+        cap = cv2.VideoCapture(0) if backend == cv2.CAP_ANY else cv2.VideoCapture(0, backend)
+        if not cap or not cap.isOpened():
+            if cap:
+                cap.release()
+            continue
+
+        # Reduce webcam latency by limiting queued frames and capture size.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.read()  # Warm up - first read is slower
+
+        print(f"Camera initialized with backend: {backend_names.get(backend, str(backend))}")
+        return cap
+
+    return None
 
 def _load_torch_model():
     """Load PyTorch punch classifier model."""
@@ -311,11 +384,14 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
     shared_pose = pose_future.result()
 
 if not cap or not cap.isOpened():
-    print("FATAL: Camera failed to initialize. Exiting.")
+    print("FATAL: Camera failed to initialize. Close other camera apps and verify OS camera permissions.")
     exit(1)
 
-tracker = PoseTracker(max_frames=15, pose=shared_pose)
-glove_images = {key: load_target_glove_image(key) for key in ("green_left", "green_right", "blue_left", "blue_right")}
+tracker = PoseTracker(max_frames=MODEL_SEQUENCE_FRAMES, pose=shared_pose)
+glove_images = {
+    key: load_target_glove_image(key)
+    for key in ("jab_front", "hook_left", "hook_right", "uppercut_up")
+}
 
 TARGET_CENTER = None
 CURRENT_TYPE = None
@@ -327,6 +403,10 @@ circle_spawn_ts = None
 protect_release_ts = None
 MAX_RUNTIME = 30
 PRESTART_COUNTDOWN_SECONDS = 3
+PREDICTION_OVERLAY_SECONDS = 1.8
+prediction_overlay_text = None
+prediction_overlay_color = (220, 220, 220)
+prediction_overlay_until = 0.0
 
 reaction_time_punch = {"jab": [], "hook": [], "uppercut": []}
 reaction_time_windows = [
@@ -471,10 +551,10 @@ def update_coverage_metrics(landmarks, w, h):
 # Create window and remove decorations (title bar, buttons) to make it non-movable
 WINDOW_NAME = "Mediapipe Feed (Press q to quit)"
 if SHOW_DISPLAY:
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.waitKey(1)  # Let the window initialize
 
-if sys.platform == "win32":
+if SHOW_DISPLAY and sys.platform == "win32":
     # Windows API constants
     GWL_STYLE = -16
     WS_CAPTION = 0x00C00000
@@ -486,15 +566,35 @@ if sys.platform == "win32":
     # Find the window handle and modify its style
     hwnd = ctypes.windll.user32.FindWindowW(None, WINDOW_NAME)
     if hwnd:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+        screen_w = ctypes.windll.user32.GetSystemMetrics(0)
+        screen_h = ctypes.windll.user32.GetSystemMetrics(1)
+
         style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
         style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)
         ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
-        # Refresh the window to apply changes
+
+        # Force fullscreen placement to match the full monitor bounds.
         SWP_FRAMECHANGED = 0x0020
-        SWP_NOMOVE = 0x0002
-        SWP_NOSIZE = 0x0001
         SWP_NOZORDER = 0x0004
-        ctypes.windll.user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER)
+        SWP_SHOWWINDOW = 0x0040
+        ctypes.windll.user32.SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            screen_w,
+            screen_h,
+            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW,
+        )
+
+        cv2.moveWindow(WINDOW_NAME, 0, 0)
+        cv2.resizeWindow(WINDOW_NAME, screen_w, screen_h)
+        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
 def get_frame():
     ret, frame = cap.read()
@@ -790,29 +890,60 @@ while cap.isOpened():
                     speed_window_combined[window_idx].append(speed_value)
 
             coords = tracker.get_last_normalized_coords()
-            if coords and len(coords) >= 15:
+            predicted_punch = None
+            confidence = None
+            is_confident = False
+            if coords and len(coords) >= MODEL_SEQUENCE_FRAMES:
                 # Flatten and normalize like in training
-                features = _flatten_normalized_features(coords)
-                if len(features) == 120:
-                    x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)  # shape [1, 120]
-                    with torch.no_grad():
-                        output = model(x)
-                        pred_class = output.argmax(dim=1).item()
+                recent_coords = coords[-MODEL_SEQUENCE_FRAMES:]
+                features = _flatten_normalized_features(recent_coords)
+                expected_feature_count = MODEL_SEQUENCE_FRAMES * LANDMARK_FEATURES_PER_FRAME
 
-                    punch_map = {0: "hook", 1: "jab", 2: "uppercut"}
-                    predicted_punch = punch_map[pred_class]
+                if len(features) == expected_feature_count:
+                    x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
+                    with torch.no_grad():
+                        logits = model(x)
+                        probs = torch.softmax(logits, dim=1)[0]
+                        pred_class = int(probs.argmax().item())
+                        confidence = float(probs[pred_class].item())
+
+                    predicted_punch = CLASS_NAMES[pred_class]
                     attempts_by_type[CURRENT_TYPE] += 1
                     punches_thrown += 1
                     if window_idx is not None:
                         accuracy_windows[window_idx]["attempts"] += 1
-                    if predicted_punch == CURRENT_TYPE:
+                    # Treat low-confidence predictions as uncertain to avoid
+                    # skewing session accuracy with unreliable classifications.
+                    is_confident = confidence >= MODEL_CONF_THRESHOLD
+                    if is_confident and predicted_punch == CURRENT_TYPE:
                         correct_punches_thrown += 1
                         correct_by_type[CURRENT_TYPE] += 1
                         if window_idx is not None:
                             accuracy_windows[window_idx]["correct"] += 1
 
-                    print(f"Model Output: {output}")
-                    print(f"Predicted Punch: {predicted_punch}")
+                    probs_dict = {
+                        class_name: round(float(probs[i].item()), 3)
+                        for i, class_name in enumerate(CLASS_NAMES)
+                    }
+                    confidence_flag = "" if is_confident else " ⚠️ low-conf"
+                    print(f"Model Logits: {logits}")
+                    print(f"Predicted Punch: {predicted_punch} ({confidence:.1%}){confidence_flag}")
+                    print(f"All probs: {probs_dict}")
+                else:
+                    print(
+                        f"⚠️ Feature length mismatch: got {len(features)}, "
+                        f"expected {expected_feature_count}"
+                    )
+
+            if predicted_punch is not None and confidence is not None:
+                confidence_flag = "" if is_confident else " ⚠️"
+                prediction_overlay_text = f"Predicted: {predicted_punch.title()} ({confidence:.0%}){confidence_flag}"
+                prediction_overlay_color = (0, 255, 0) if is_confident else (0, 165, 255)
+            else:
+                prediction_overlay_text = f"Predicted: Warming up ({MODEL_SEQUENCE_FRAMES} frames)"
+                prediction_overlay_color = (220, 220, 220)
+            prediction_overlay_until = now + PREDICTION_OVERLAY_SECONDS
+
             TARGET_CENTER = respawn_target(landmarks, w, h, TARGET_RADIUS)
             CURRENT_TYPE = choose_punch_type()
             TARGET_GLOVE_KEY = choose_target_glove_key(CURRENT_TYPE)
@@ -826,13 +957,48 @@ while cap.isOpened():
             if glove_image is not None:
                 draw_target_glove(image, TARGET_CENTER, TARGET_RADIUS, glove_image, TARGET_GLOVE_KEY)
             else:
-                # Draw a simple colored circle for jab targets
+                # Fallback if an expected punchpad image is missing.
                 color = PUNCH_COLORS.get(CURRENT_TYPE, (0, 0, 255))
                 cv2.circle(image, TARGET_CENTER, TARGET_RADIUS, color, -1)
 
         defense_game.update(image, landmarks, now)
 
         display_image = cv2.flip(image, 1)
+
+        if prediction_overlay_text and now <= prediction_overlay_until:
+            overlay_font = cv2.FONT_HERSHEY_DUPLEX
+            overlay_scale = 1.0
+            overlay_thickness = 2
+            text_size, _ = cv2.getTextSize(prediction_overlay_text, overlay_font, overlay_scale, overlay_thickness)
+            text_x = max((display_image.shape[1] - text_size[0]) // 2, 10)
+            text_y = max(int(display_image.shape[0] * 0.1), text_size[1] + 16)
+            pad = 12
+
+            cv2.rectangle(
+                display_image,
+                (text_x - pad, text_y - text_size[1] - pad),
+                (text_x + text_size[0] + pad, text_y + pad),
+                (0, 0, 0),
+                -1,
+            )
+            cv2.rectangle(
+                display_image,
+                (text_x - pad, text_y - text_size[1] - pad),
+                (text_x + text_size[0] + pad, text_y + pad),
+                prediction_overlay_color,
+                2,
+            )
+            cv2.putText(
+                display_image,
+                prediction_overlay_text,
+                (text_x, text_y),
+                overlay_font,
+                overlay_scale,
+                prediction_overlay_color,
+                overlay_thickness,
+                cv2.LINE_AA,
+            )
+
         show_frame(WINDOW_NAME, display_image)
 
         if wait_key(1):

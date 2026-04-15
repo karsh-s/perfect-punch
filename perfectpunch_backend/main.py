@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
-import os, json, time, subprocess
+import os, json, time, subprocess, sys
 from datetime import datetime
 
 # Load environment
@@ -75,17 +75,34 @@ def start_punch_analysis():
         env['SHOW_DISPLAY'] = 'true'
         
         result = subprocess.run(
-            ["python", "-m", "perfectpunch_backend.main_python_analysis"],
+            [sys.executable, "-m", "perfectpunch_backend.main_python_analysis"],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            # Don't capture output so camera window can display
             timeout=120,  # 2 minute timeout
-            env=env  # Pass the environment with SHOW_DISPLAY=true
+            env=env,  # Pass the environment with SHOW_DISPLAY=true
+            capture_output=True,
+            text=True,
         )
         
         # Check if the script ran successfully
         if result.returncode != 0:
             print(f"❌ Analysis failed with return code {result.returncode}")
-            raise HTTPException(status_code=500, detail=f"Analysis failed with return code {result.returncode}")
+            output_lines = []
+            if result.stdout:
+                output_lines.extend([line.strip() for line in result.stdout.splitlines() if line.strip()])
+            if result.stderr:
+                output_lines.extend([line.strip() for line in result.stderr.splitlines() if line.strip()])
+
+            detail = f"Analysis failed with return code {result.returncode}"
+            if output_lines:
+                preferred = None
+                for line in reversed(output_lines):
+                    upper_line = line.upper()
+                    if "FATAL" in upper_line or "ERROR" in upper_line or "TRACEBACK" in upper_line or "EXCEPTION" in upper_line:
+                        preferred = line
+                        break
+                detail += f". Last log: {(preferred or output_lines[-1])}"
+
+            raise HTTPException(status_code=500, detail=detail)
         
         print("✅ Analysis completed successfully")
         

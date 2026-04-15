@@ -4,7 +4,7 @@ pydantic
 celery
 redis
 opencv-python
-mediapipe
+mediapipe==0.10.9
 torch
 taipy
 scikit-learn

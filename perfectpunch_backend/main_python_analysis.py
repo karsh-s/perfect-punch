@@ -5,10 +5,12 @@ import concurrent.futures
 import ctypes
 import json
 import math
+from collections import deque
 from datetime import datetime
 import sys
 import os
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,7 +28,6 @@ try:
         load_target_glove_image,
     )
 except ImportError:
-    # Fallback for direct script execution (no package context).
     from extractDataPoints import PoseTracker
     from defense import DefenseGame
     from target_utils import (
@@ -39,20 +40,40 @@ except ImportError:
         load_target_glove_image,
     )
 
-# Flag to disable display for headless/backend environments
-SHOW_DISPLAY = os.getenv('SHOW_DISPLAY', 'false').lower() == 'true'
-MODEL_SEQUENCE_FRAMES = 50
-LANDMARK_FEATURES_PER_FRAME = 8
+# Show OpenCV window by default; set SHOW_DISPLAY=false to force headless mode.
+SHOW_DISPLAY = os.getenv('SHOW_DISPLAY', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
+
+# ── Model / pipeline constants (must match training config) ─────────────────
+CLIP_FRAMES          = 50          # frames per clip at TARGET_FPS
+TARGET_FPS           = 60          # resample target (training standard)
+WORLD_BUFFER_FRAMES  = 150         # raw-FPS rolling buffer (~5 s at 30 fps)
+VEL_WINDOW           = 7           # velocity smoothing kernel
+VELOCITY_LM          = [11, 12, 13, 14, 15, 16]  # landmarks for compound velocity
 MODEL_CONF_THRESHOLD = 0.55
-CLASS_NAMES = ("hook", "jab", "uppercut")
-FEATURE_LANDMARK_ORDER = ("RIGHT_ELBOW", "RIGHT_WRIST", "LEFT_ELBOW", "LEFT_WRIST")
+CLASS_NAMES          = ('jab', 'lead-hook', 'rear-uppercut')
+N_CLASSES            = len(CLASS_NAMES)
+
+# Maps model output names → target_utils punch type names used by choose_punch_type()
+MODEL_TO_TARGET = {
+    'jab':           'jab',
+    'lead-hook':     'hook',
+    'rear-uppercut': 'uppercut',
+}
+
+# ── Landmark indices ─────────────────────────────────────────────────────────
+L_SHOULDER, R_SHOULDER = 11, 12
+L_ELBOW,    R_ELBOW    = 13, 14
+L_WRIST,    R_WRIST    = 15, 16
+TRACK    = [L_ELBOW, R_ELBOW, L_WRIST, R_WRIST]
+SHOULDER = [L_SHOULDER, R_SHOULDER, L_SHOULDER, R_SHOULDER]
 
 mp_drawing = mp.solutions.drawing_utils
-mp_pose = mp.solutions.pose
+mp_pose    = mp.solutions.pose
 
+
+# ── Display helpers ──────────────────────────────────────────────────────────
 
 def show_frame(window_name, frame):
-    """Display frame only if display is enabled."""
     if SHOW_DISPLAY:
         try:
             cv2.imshow(window_name, frame)
@@ -61,7 +82,6 @@ def show_frame(window_name, frame):
 
 
 def wait_key(delay=1):
-    """Wait for key input only if display is enabled. Returns quit flag."""
     if SHOW_DISPLAY:
         try:
             if cv2.waitKey(delay) & 0xFF == ord('q'):
@@ -70,6 +90,8 @@ def wait_key(delay=1):
             pass
     return False
 
+
+# ── Session windowing helpers ────────────────────────────────────────────────
 
 def _get_time_window_index(elapsed_seconds):
     if elapsed_seconds <= 10:
@@ -82,230 +104,264 @@ def _get_time_window_index(elapsed_seconds):
 
 
 def _get_spawn_timing(now, protect_seconds):
-    circle_ts = now
-    return now, circle_ts, circle_ts + protect_seconds
+    return now, now, now + protect_seconds
 
+
+# ── Speed computation (2-D pixel coords, kept for session metrics) ───────────
 
 def _compute_speed_value(raw_coords, fps_value):
     if not raw_coords or len(raw_coords) < 2:
         return None
-
     frame_pair_speeds = []
     for i in range(len(raw_coords) - 1):
         lm_a = raw_coords[i].get("landmarks")
         lm_b = raw_coords[i + 1].get("landmarks")
         if not lm_a or not lm_b:
             continue
-
         pair_disps = []
         for wrist_name in ("RIGHT_WRIST", "LEFT_WRIST"):
             if wrist_name in lm_a and wrist_name in lm_b:
                 dx = lm_b[wrist_name]["x"] - lm_a[wrist_name]["x"]
                 dy = lm_b[wrist_name]["y"] - lm_a[wrist_name]["y"]
                 pair_disps.append(math.hypot(dx, dy))
-
         if pair_disps:
             frame_pair_speeds.append(max(pair_disps) * fps_value)
-
     if not frame_pair_speeds:
         return None
-
-    # Average the top 3 highest frame-pair speeds.
     top_speeds = sorted(frame_pair_speeds, reverse=True)[:3]
     return sum(top_speeds) / len(top_speeds)
 
 
-def _flatten_normalized_features(coords):
-    features = []
-    for record in coords:
-        landmarks = record.get("landmarks")
-        if not landmarks:
-            continue
+# ── Skeleton preprocessing (identical to training pipeline) ─────────────────
 
-        # Preserve a fixed landmark order so model inputs match training layout.
-        if any(name not in landmarks for name in FEATURE_LANDMARK_ORDER):
-            continue
+def normalize_skeleton(lm_list):
+    """Hip-centred, shoulder-width-normalised. Returns (33, 4)."""
+    coords = np.array([[l.x, l.y, l.z, l.visibility] for l in lm_list],
+                      dtype=np.float32)
+    hip_c = (coords[23][:3] + coords[24][:3]) / 2
+    coords[:, :3] -= hip_c
+    dist = np.linalg.norm(coords[11][:3] - coords[12][:3])
+    if dist > 1e-6:
+        coords[:, :3] /= dist
+    return coords
 
-        for landmark_name in FEATURE_LANDMARK_ORDER:
-            point = landmarks[landmark_name]
-            features.extend([point["x"], point["y"]])
-    return features
 
-class Model(nn.Module):
-    """3D CNN model for punch classification with spatial, temporal, and residual branches."""
-    
-    def __init__(self, num_classes=3):
-        super(Model, self).__init__()
-        
-        # Stem layer: Initial 3D convolution (7 input channels for pose landmarks)
-        self.stem = nn.Sequential(
-            nn.Conv3d(7, 32, kernel_size=(3, 3, 3), padding=(1, 1, 1), bias=False),
-            nn.BatchNorm3d(32),
-            nn.ReLU(inplace=True)
+def compound_velocity(curr, prev):
+    diffs = [np.linalg.norm(curr[lm][:3] - prev[lm][:3]) for lm in VELOCITY_LM]
+    return float(np.sqrt(np.mean(np.array(diffs) ** 2)))
+
+
+def resample_frames(frames, src_fps, dst_fps=TARGET_FPS):
+    """Temporally resample skeleton frames from src_fps to dst_fps."""
+    n_src = len(frames)
+    if n_src < 2 or abs(src_fps - dst_fps) < 0.5:
+        return np.array(frames, dtype=np.float32)
+    arr   = np.array(frames, dtype=np.float32)       # (N, 33, 4)
+    dur   = n_src / src_fps
+    n_dst = max(2, int(round(dur * dst_fps)))
+    t_src = np.linspace(0, 1, n_src)
+    t_dst = np.linspace(0, 1, n_dst)
+    out   = np.zeros((n_dst, arr.shape[1], arr.shape[2]), dtype=np.float32)
+    for j in range(arr.shape[1]):
+        for c in range(arr.shape[2]):
+            out[:, j, c] = np.interp(t_dst, t_src, arr[:, j, c])
+    return out
+
+
+def angle_cos(a, b, c):
+    ba = a - b
+    bc = c - b
+    return float(np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-8))
+
+
+def build_tensor(clip):
+    """
+    clip : (T, 33, 4)
+    Returns float32 tensor of shape (7, T, 4, 3).
+
+    ch0 -- position xyz
+    ch1 -- velocity xyz (frame-to-frame displacement)
+    ch2 -- geometry (bone unit vectors + elbow flexion angle)
+    ch3 -- y-velocity (vertical motion per joint)
+    ch4 -- elbow flexion angle broadcast to all joints
+    ch5 -- lateral dominance (x_vel / horizontal_vel)
+    ch6 -- vertical dominance (y_vel / total_vel)
+    """
+    T   = clip.shape[0]
+    xyz = clip[:, :, :3].astype(np.float32)       # (T, 33, 3)
+    tracked = xyz[:, TRACK, :]                     # (T, 4, 3)
+
+    # ch0: position
+    ch0 = tracked.copy()
+
+    # ch1: velocity
+    ch1     = np.zeros_like(tracked)
+    ch1[1:] = tracked[1:] - tracked[:-1]
+
+    # ch2: bone unit vectors + elbow angle override
+    ch2 = np.zeros_like(tracked)
+    for t in range(T):
+        f = xyz[t]
+        for i in range(4):
+            if i < 2:   # elbows: shoulder → elbow
+                v = f[TRACK[i]] - f[SHOULDER[i]]
+            else:       # wrists: elbow → wrist
+                v = f[TRACK[i]] - f[TRACK[i - 2]]
+            ch2[t, i] = v / (np.linalg.norm(v) + 1e-8)
+        ch2[t, 0, 0] = angle_cos(f[L_SHOULDER], f[L_ELBOW], f[L_WRIST])
+        ch2[t, 1, 0] = angle_cos(f[R_SHOULDER], f[R_ELBOW], f[R_WRIST])
+
+    # ch3: y-velocity
+    ch3   = np.zeros_like(tracked)
+    y_vel = np.zeros((T, 4), dtype=np.float32)
+    for i, lm in enumerate(TRACK):
+        y_vel[1:, i] = xyz[1:, lm, 1] - xyz[:-1, lm, 1]
+    ch3[:, :, :] = y_vel[:, :, np.newaxis]
+
+    # ch4: elbow flexion angle broadcast
+    ch4 = np.zeros_like(tracked)
+    for t in range(T):
+        f = xyz[t]
+        l_angle = angle_cos(f[L_SHOULDER], f[L_ELBOW], f[L_WRIST])
+        r_angle = angle_cos(f[R_SHOULDER], f[R_ELBOW], f[R_WRIST])
+        ch4[t, 0, :] = l_angle
+        ch4[t, 1, :] = r_angle
+        ch4[t, 2, :] = l_angle
+        ch4[t, 3, :] = r_angle
+
+    # ch5: lateral dominance (x_vel / sqrt(x²+z²))
+    ch5 = np.zeros_like(tracked)
+    eps = 1e-8
+    elbow_vel   = ch1[:, :2, :]
+    elbow_speed = np.sqrt(elbow_vel[:, :, 0:1]**2 + elbow_vel[:, :, 2:3]**2) + eps
+    elbow_lat   = elbow_vel[:, :, 0:1] / elbow_speed
+    ch5[:, 0, :] = elbow_lat[:, 0, 0, np.newaxis]
+    ch5[:, 1, :] = elbow_lat[:, 1, 0, np.newaxis]
+    wrist_vel   = ch1[:, 2:, :]
+    wrist_speed = np.sqrt(wrist_vel[:, :, 0:1]**2 + wrist_vel[:, :, 2:3]**2) + eps
+    wrist_lat   = wrist_vel[:, :, 0:1] / wrist_speed
+    ch5[:, 2, :] = wrist_lat[:, 0, 0, np.newaxis]
+    ch5[:, 3, :] = wrist_lat[:, 1, 0, np.newaxis]
+
+    # ch6: vertical dominance (y_vel / total_vel)
+    total_speed = np.linalg.norm(ch1, axis=-1, keepdims=True) + eps
+    vert_dom    = ch1[:, :, 1:2] / total_speed
+    ch6         = np.broadcast_to(vert_dom, tracked.shape).copy()
+
+    return np.stack([ch0, ch1, ch2, ch3, ch4, ch5, ch6], axis=0).astype(np.float32)
+
+
+def extract_live_clip(raw_frames, src_fps):
+    """
+    Adapt extract_best_clip for a live rolling buffer.
+    raw_frames : list of (33, 4) arrays at native camera FPS
+    Returns (CLIP_FRAMES, 33, 4) float32, or None if not enough data.
+    """
+    if len(raw_frames) < 2:
+        return None
+
+    resampled = resample_frames(raw_frames, src_fps, TARGET_FPS)
+    n = len(resampled)
+    if n < CLIP_FRAMES:
+        return None
+
+    # Compute smoothed compound velocity on the resampled sequence
+    all_vels = [0.0]
+    for i in range(1, n):
+        all_vels.append(compound_velocity(resampled[i], resampled[i - 1]))
+    vels   = np.array(all_vels, dtype=np.float32)
+    kernel = np.ones(VEL_WINDOW) / VEL_WINDOW
+    smooth = np.convolve(vels, kernel, mode='same')
+
+    # Peak restricted so full window fits in bounds
+    min_peak = CLIP_FRAMES - 1
+    max_peak = n - 1
+    peak     = int(np.argmax(smooth[min_peak:max_peak + 1])) + min_peak
+
+    end   = peak + 1
+    start = end - CLIP_FRAMES
+    return resampled[start:end]   # (CLIP_FRAMES, 33, 4)
+
+
+# ── Model architecture ───────────────────────────────────────────────────────
+
+class Conv2Plus1DBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, kt=3, kj=3, kc=3, stride_t=1, dropout=0.1):
+        super().__init__()
+        mid = max(in_ch, out_ch) // 2 if in_ch != out_ch else in_ch
+        self.spatial = nn.Sequential(
+            nn.Conv3d(in_ch, mid, kernel_size=(1, kj, kc),
+                      padding=(0, kj // 2, kc // 2), bias=False),
+            nn.BatchNorm3d(mid),
+            nn.ReLU(inplace=True),
         )
-        
-        # Layer 1: in=32, spatial_out=32, temporal_out=64, residual_out=64
-        self.layer1 = nn.ModuleDict({
-            'spatial': nn.Sequential(
-                nn.Conv3d(32, 32, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
-                nn.BatchNorm3d(32),
-            ),
-            'temporal': nn.Sequential(
-                nn.Conv3d(32, 64, kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=False),
-                nn.BatchNorm3d(64),
-            ),
-            'residual': nn.Sequential(
-                nn.Conv3d(32, 64, kernel_size=(1, 1, 1), bias=False),
-                nn.BatchNorm3d(64),
-            )
-        })
-        
-        # Layer 2: in=64, spatial_out=64, temporal_out=128, residual_out=128
-        self.layer2 = nn.ModuleDict({
-            'spatial': nn.Sequential(
-                nn.Conv3d(64, 64, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
-                nn.BatchNorm3d(64),
-            ),
-            'temporal': nn.Sequential(
-                nn.Conv3d(64, 128, kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=False),
-                nn.BatchNorm3d(128),
-            ),
-            'residual': nn.Sequential(
-                nn.Conv3d(64, 128, kernel_size=(1, 1, 1), bias=False),
-                nn.BatchNorm3d(128),
-            )
-        })
-        
-        # Layer 3: in=128, spatial_out=128, temporal_out=256, residual_out=256
-        self.layer3 = nn.ModuleDict({
-            'spatial': nn.Sequential(
-                nn.Conv3d(128, 128, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
-                nn.BatchNorm3d(128),
-            ),
-            'temporal': nn.Sequential(
-                nn.Conv3d(128, 256, kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=False),
-                nn.BatchNorm3d(256),
-            ),
-            'residual': nn.Sequential(
-                nn.Conv3d(128, 256, kernel_size=(1, 1, 1), bias=False),
-                nn.BatchNorm3d(256),
-            )
-        })
-        
-        # Layer 4: in=256, spatial_out=256, temporal_out=256, no residual
-        self.layer4 = nn.ModuleDict({
-            'spatial': nn.Sequential(
-                nn.Conv3d(256, 256, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
-                nn.BatchNorm3d(256),
-            ),
-            'temporal': nn.Sequential(
-                nn.Conv3d(256, 256, kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=False),
-                nn.BatchNorm3d(256),
-            )
-        })
-        
-        # Layer 5: in=256, spatial_out=256, temporal_out=512, residual_out=512
-        self.layer5 = nn.ModuleDict({
-            'spatial': nn.Sequential(
-                nn.Conv3d(256, 256, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
-                nn.BatchNorm3d(256),
-            ),
-            'temporal': nn.Sequential(
-                nn.Conv3d(256, 512, kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=False),
-                nn.BatchNorm3d(512),
-            ),
-            'residual': nn.Sequential(
-                nn.Conv3d(256, 512, kernel_size=(1, 1, 1), bias=False),
-                nn.BatchNorm3d(512),
-            )
-        })
-        
-        # Layer 6: in=512, spatial_out=512, temporal_out=512, no residual
-        self.layer6 = nn.ModuleDict({
-            'spatial': nn.Sequential(
-                nn.Conv3d(512, 512, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
-                nn.BatchNorm3d(512),
-            ),
-            'temporal': nn.Sequential(
-                nn.Conv3d(512, 512, kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=False),
-                nn.BatchNorm3d(512),
-            )
-        })
-        
-        # Global average pooling
-        self.avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
-        
-        # Classifier head matches saved model structure
-        # Saved model has keys: classifier.2 (Linear 512->256), classifier.5 (Linear 256->3)
-        # So we use placeholder modules for indices 0,1,3,4 to match saved weights at 2 and 5
-        self.classifier = nn.Sequential(
-            nn.Identity(),  # classifier.0
-            nn.Identity(),  # classifier.1
-            nn.Linear(512, 256),  # classifier.2: takes pooled output (512 channels)
-            nn.ReLU(inplace=True),  # classifier.3
-            nn.Identity(),  # classifier.4 (could be Dropout)
-            nn.Linear(256, num_classes)  # classifier.5: outputs num_classes (3)
+        self.temporal = nn.Sequential(
+            nn.Conv3d(mid, out_ch, kernel_size=(kt, 1, 1),
+                      stride=(stride_t, 1, 1), padding=(kt // 2, 0, 0), bias=False),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
         )
-    
+        self.drop = nn.Dropout3d(dropout)
+        self.residual = (
+            nn.Identity()
+            if (in_ch == out_ch and stride_t == 1)
+            else nn.Sequential(
+                nn.Conv3d(in_ch, out_ch, 1, stride=(stride_t, 1, 1), bias=False),
+                nn.BatchNorm3d(out_ch),
+            )
+        )
+
     def forward(self, x):
-        # x shape: (batch, channels, depth, height, width)
-        # If input is 2D features (batch, features), reshape appropriately
-        if x.dim() == 2:
-            batch_size = x.shape[0]
-            feature_count = x.shape[1]
-            if feature_count % LANDMARK_FEATURES_PER_FRAME != 0:
-                raise ValueError(
-                    f"Expected feature count divisible by {LANDMARK_FEATURES_PER_FRAME}, got {feature_count}"
-                )
+        return F.relu(
+            self.drop(self.temporal(self.spatial(x))) + self.residual(x),
+            inplace=True,
+        )
 
-            sequence_len = feature_count // LANDMARK_FEATURES_PER_FRAME
-            x = x.unsqueeze(1).expand(-1, 7, -1)  # (batch, 7, 120)
-            x = x.view(batch_size, 7, sequence_len, LANDMARK_FEATURES_PER_FRAME, 1)
-        
+
+class PerfectPunchCNN(nn.Module):
+    """
+    6-block (2+1)D CNN for skeleton punch classification.
+    Input:  (B, 7, T, 4, 3)  — 7 channels, T=CLIP_FRAMES frames, 4 arm joints, 3 coords
+    Output: (B, num_classes)
+    """
+    def __init__(self, num_classes=N_CLASSES, in_channels=7, base_ch=32, dropout=0.4):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv3d(in_channels, base_ch, kernel_size=(3, 3, 3),
+                      padding=(1, 1, 1), bias=False),
+            nn.BatchNorm3d(base_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.layer1 = Conv2Plus1DBlock(base_ch,      base_ch * 2,  kt=3, dropout=0.10)
+        self.layer2 = Conv2Plus1DBlock(base_ch * 2,  base_ch * 4,  kt=3, stride_t=2, dropout=0.10)
+        self.layer3 = Conv2Plus1DBlock(base_ch * 4,  base_ch * 8,  kt=3, stride_t=2, dropout=0.15)
+        self.layer4 = Conv2Plus1DBlock(base_ch * 8,  base_ch * 8,  kt=3, dropout=0.15)
+        self.layer5 = Conv2Plus1DBlock(base_ch * 8,  base_ch * 16, kt=3, stride_t=2, dropout=0.20)
+        self.layer6 = Conv2Plus1DBlock(base_ch * 16, base_ch * 16, kt=3, dropout=0.20)
+        self.pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(dropout),
+            nn.Linear(base_ch * 16, base_ch * 8),
+            nn.GELU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(base_ch * 8, num_classes),
+        )
+
+    def forward(self, x):   # x: (B, 7, T, 4, 3)
         x = self.stem(x)
-        
-        # Layer 1
-        spatial = F.relu(self.layer1['spatial'](x))
-        temporal = F.relu(self.layer1['temporal'](spatial))
-        residual = F.relu(self.layer1['residual'](x))
-        x = temporal + residual
-        
-        # Layer 2
-        spatial = F.relu(self.layer2['spatial'](x))
-        temporal = F.relu(self.layer2['temporal'](spatial))
-        residual = F.relu(self.layer2['residual'](x))
-        x = temporal + residual
-        
-        # Layer 3
-        spatial = F.relu(self.layer3['spatial'](x))
-        temporal = F.relu(self.layer3['temporal'](spatial))
-        residual = F.relu(self.layer3['residual'](x))
-        x = temporal + residual
-        
-        # Layer 4: no residual connection
-        spatial = F.relu(self.layer4['spatial'](x))
-        temporal = F.relu(self.layer4['temporal'](spatial))
-        x = temporal
-        
-        # Layer 5
-        spatial = F.relu(self.layer5['spatial'](x))
-        temporal = F.relu(self.layer5['temporal'](spatial))
-        residual = F.relu(self.layer5['residual'](x))
-        x = temporal + residual
-        
-        # Layer 6: no residual connection
-        spatial = F.relu(self.layer6['spatial'](x))
-        temporal = F.relu(self.layer6['temporal'](spatial))
-        x = temporal
-        
-        x = self.avg_pool(x)
-        x = x.view(x.size(0), -1)
-        x = self.classifier(x)
-        
-        return x
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.layer5(x)
+        x = self.layer6(x)
+        x = self.pool(x)
+        return self.classifier(x)
 
 
-# --- Parallel initialization functions ---
+# ── Camera backend helpers ───────────────────────────────────────────────────
+
 def _camera_backend_candidates():
     if sys.platform == "win32":
         return [
@@ -325,118 +381,121 @@ def _camera_backend_candidates():
 
 
 def _load_camera():
-    """Initialize camera and warm it up with first frame read."""
     attempted = set()
     backend_names = {
-        getattr(cv2, "CAP_DSHOW", -1): "CAP_DSHOW",
-        getattr(cv2, "CAP_MSMF", -1): "CAP_MSMF",
-        getattr(cv2, "CAP_AVFOUNDATION", -1): "CAP_AVFOUNDATION",
-        getattr(cv2, "CAP_V4L2", -1): "CAP_V4L2",
-        cv2.CAP_ANY: "CAP_ANY",
+        getattr(cv2, "CAP_DSHOW", -1):        "CAP_DSHOW",
+        getattr(cv2, "CAP_MSMF", -1):         "CAP_MSMF",
+        getattr(cv2, "CAP_AVFOUNDATION", -1):  "CAP_AVFOUNDATION",
+        getattr(cv2, "CAP_V4L2", -1):          "CAP_V4L2",
+        cv2.CAP_ANY:                            "CAP_ANY",
     }
-
     for backend in _camera_backend_candidates():
         if backend in attempted:
             continue
         attempted.add(backend)
-
         cap = cv2.VideoCapture(0) if backend == cv2.CAP_ANY else cv2.VideoCapture(0, backend)
         if not cap or not cap.isOpened():
             if cap:
                 cap.release()
             continue
-
-        # Reduce webcam latency by limiting queued frames and capture size.
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
         cap.set(cv2.CAP_PROP_FPS, 30)
-        cap.read()  # Warm up - first read is slower
-
+        cap.read()
         print(f"Camera initialized with backend: {backend_names.get(backend, str(backend))}")
         return cap
-
     return None
 
+
 def _load_torch_model():
-    """Load PyTorch punch classifier model."""
-    model = Model()
-    model.load_state_dict(torch.load("perfectpunch_backend/models/model_state.pt", map_location='cpu'))
-    model.eval()
-    return model
+    """Load PerfectPunchCNN checkpoint."""
+    m = PerfectPunchCNN(num_classes=N_CLASSES)
+    m.load_state_dict(
+        torch.load("perfectpunch_backend/models/best_punch_model.pt", map_location="cpu")
+    )
+    m.eval()
+    return m
+
 
 def _load_mediapipe_pose():
-    """Initialize MediaPipe Pose (ML model loading is slow)."""
     return mp_pose.Pose(
         model_complexity=0,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
 
-# --- Run all heavy initialization in parallel ---
+
+# ── Parallel initialisation ──────────────────────────────────────────────────
 with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-    cap_future = executor.submit(_load_camera)
+    cap_future   = executor.submit(_load_camera)
     model_future = executor.submit(_load_torch_model)
-    pose_future = executor.submit(_load_mediapipe_pose)
-    
-    cap = cap_future.result()
-    model = model_future.result()
+    pose_future  = executor.submit(_load_mediapipe_pose)
+
+    cap         = cap_future.result()
+    model       = model_future.result()
     shared_pose = pose_future.result()
 
 if not cap or not cap.isOpened():
-    print("FATAL: Camera failed to initialize. Close other camera apps and verify OS camera permissions.")
+    print("FATAL: Camera failed to initialize.")
     exit(1)
 
-tracker = PoseTracker(max_frames=MODEL_SEQUENCE_FRAMES, pose=shared_pose)
+# Read camera FPS once — used by resampler and speed metrics
+actual_fps = cap.get(cv2.CAP_PROP_FPS)
+if not actual_fps or actual_fps <= 0:
+    actual_fps = 30.0
+print(f"Camera FPS: {actual_fps:.1f}")
+
+# ── Tracker and world-landmark buffer ───────────────────────────────────────
+# PoseTracker: holds 2-D pixel coords used for px/s speed metric
+tracker = PoseTracker(max_frames=WORLD_BUFFER_FRAMES, pose=shared_pose)
+
+# Rolling buffer of (33, 4) world-landmark frames fed into the model pipeline
+world_frame_buffer: deque = deque(maxlen=WORLD_BUFFER_FRAMES)
+
 glove_images = {
     key: load_target_glove_image(key)
     for key in ("jab_front", "hook_left", "hook_right", "uppercut_up")
 }
 
-TARGET_CENTER = None
-CURRENT_TYPE = None
+TARGET_CENTER    = None
+CURRENT_TYPE     = None
 TARGET_GLOVE_KEY = None
-TARGET_RADIUS = 25 
-SPAWN_PROTECT_S = 1
-last_spawn_ts = 0.0
-circle_spawn_ts = None
+TARGET_RADIUS    = 25
+SPAWN_PROTECT_S  = 1
+TARGET_RESPAWN_DELAY_S = 2.0
+last_spawn_ts    = 0.0
+circle_spawn_ts  = None
 protect_release_ts = None
-MAX_RUNTIME = 30
-PRESTART_COUNTDOWN_SECONDS = 3
-PREDICTION_OVERLAY_SECONDS = 1.8
-prediction_overlay_text = None
-prediction_overlay_color = (220, 220, 220)
-prediction_overlay_until = 0.0
+next_target_spawn_ts = 0.0
+MAX_RUNTIME                 = 30
+PRESTART_COUNTDOWN_SECONDS  = 3
+PREDICTION_OVERLAY_SECONDS  = 1.8
+prediction_overlay_text     = None
+prediction_overlay_color    = (220, 220, 220)
+prediction_overlay_until    = 0.0
 
-reaction_time_punch = {"jab": [], "hook": [], "uppercut": []}
-reaction_time_windows = [
-    {k: [] for k in reaction_time_punch.keys()},
-    {k: [] for k in reaction_time_punch.keys()},
-    {k: [] for k in reaction_time_punch.keys()},
-]
+reaction_time_punch    = {"jab": [], "hook": [], "uppercut": []}
+reaction_time_windows  = [{k: [] for k in reaction_time_punch} for _ in range(3)]
 correct_punches_thrown = 0
-punches_thrown = 0
-attempts_by_type = {k: 0 for k in reaction_time_punch.keys()}
-correct_by_type = {k: 0 for k in reaction_time_punch.keys()}
-accuracy_windows = [{"correct": 0, "attempts": 0} for _ in range(3)]
+punches_thrown         = 0
+attempts_by_type       = {k: 0 for k in reaction_time_punch}
+correct_by_type        = {k: 0 for k in reaction_time_punch}
+accuracy_windows       = [{"correct": 0, "attempts": 0} for _ in range(3)]
 reaction_window_combined = [[] for _ in range(3)]
-speed_by_type = {k: [] for k in reaction_time_punch.keys()}
-speed_windows = [
-    {k: [] for k in reaction_time_punch.keys()},
-    {k: [] for k in reaction_time_punch.keys()},
-    {k: [] for k in reaction_time_punch.keys()},
-]
-speed_window_combined = [[] for _ in range(3)]
+speed_by_type          = {k: [] for k in reaction_time_punch}
+speed_windows          = [{k: [] for k in reaction_time_punch} for _ in range(3)]
+speed_window_combined  = [[] for _ in range(3)]
 coverage_tracker = {
     "head": {"covered": 0, "total": 0},
     "body": {"covered": 0, "total": 0},
 }
 exposure_tracker = {
-    "left_shoulder": {"covered": 0, "total": 0},
+    "left_shoulder":  {"covered": 0, "total": 0},
     "right_shoulder": {"covered": 0, "total": 0},
-    "chest": {"covered": 0, "total": 0},
-    "abdomen": {"covered": 0, "total": 0},
-    "hips": {"covered": 0, "total": 0},
+    "chest":          {"covered": 0, "total": 0},
+    "abdomen":        {"covered": 0, "total": 0},
+    "hips":           {"covered": 0, "total": 0},
 }
 defense_game = DefenseGame()
 
@@ -459,10 +518,8 @@ def update_coverage_metrics(landmarks, w, h):
         return
 
     def get_coords(lm_enum_or_index):
-        if isinstance(lm_enum_or_index, int):
-            lm = landmarks[lm_enum_or_index]
-        else:
-            lm = landmarks[lm_enum_or_index.value]
+        lm = landmarks[lm_enum_or_index if isinstance(lm_enum_or_index, int)
+                       else lm_enum_or_index.value]
         return int(lm.x * w), int(lm.y * h)
 
     rw_x, rw_y = get_coords(mp_pose.PoseLandmark.RIGHT_WRIST)
@@ -477,124 +534,83 @@ def update_coverage_metrics(landmarks, w, h):
 
     arm_padding = 20
     right_arm_rect = _clamp_rect(
-        min(rs_x, re_x, rw_x) - arm_padding,
-        min(rs_y, re_y, rw_y) - arm_padding,
-        max(rs_x, re_x, rw_x) + arm_padding,
-        max(rs_y, re_y, rw_y) + arm_padding,
-        w,
-        h,
-    )
+        min(rs_x, re_x, rw_x) - arm_padding, min(rs_y, re_y, rw_y) - arm_padding,
+        max(rs_x, re_x, rw_x) + arm_padding, max(rs_y, re_y, rw_y) + arm_padding, w, h)
     left_arm_rect = _clamp_rect(
-        min(ls_x, le_x, lw_x) - arm_padding,
-        min(ls_y, le_y, lw_y) - arm_padding,
-        max(ls_x, le_x, lw_x) + arm_padding,
-        max(ls_y, le_y, lw_y) + arm_padding,
-        w,
-        h,
-    )
+        min(ls_x, le_x, lw_x) - arm_padding, min(ls_y, le_y, lw_y) - arm_padding,
+        max(ls_x, le_x, lw_x) + arm_padding, max(ls_y, le_y, lw_y) + arm_padding, w, h)
 
     def is_region_guarded(region_rect):
         x1, y1, x2, y2 = region_rect
-        return (
-            _rects_overlap(x1, y1, x2, y2, *right_arm_rect)
-            or _rects_overlap(x1, y1, x2, y2, *left_arm_rect)
-        )
+        return (_rects_overlap(x1, y1, x2, y2, *right_arm_rect) or
+                _rects_overlap(x1, y1, x2, y2, *left_arm_rect))
 
     head_padding = 30
     head_rect = _clamp_rect(
-        min(ls_x, rs_x) - head_padding,
-        min(nose_y, ls_y, rs_y) - head_padding,
-        max(ls_x, rs_x) + head_padding,
-        max(nose_y, ls_y, rs_y) + head_padding,
-        w,
-        h,
-    )
+        min(ls_x, rs_x) - head_padding, min(nose_y, ls_y, rs_y) - head_padding,
+        max(ls_x, rs_x) + head_padding, max(nose_y, ls_y, rs_y) + head_padding, w, h)
     coverage_tracker["head"]["total"] += 1
     if is_region_guarded(head_rect):
         coverage_tracker["head"]["covered"] += 1
 
     body_padding = 25
     body_rect = _clamp_rect(
-        min(ls_x, rs_x, lh_x, rh_x) - body_padding,
-        min(ls_y, rs_y) - body_padding,
-        max(ls_x, rs_x, lh_x, rh_x) + body_padding,
-        max(lh_y, rh_y) + body_padding,
-        w,
-        h,
-    )
+        min(ls_x, rs_x, lh_x, rh_x) - body_padding, min(ls_y, rs_y) - body_padding,
+        max(ls_x, rs_x, lh_x, rh_x) + body_padding, max(lh_y, rh_y) + body_padding, w, h)
     coverage_tracker["body"]["total"] += 1
     if is_region_guarded(body_rect):
         coverage_tracker["body"]["covered"] += 1
 
     area_half = 45
     area_definitions = {
-        "left_shoulder": (ls_x, ls_y),
+        "left_shoulder":  (ls_x, ls_y),
         "right_shoulder": (rs_x, rs_y),
-        "chest": ((ls_x + rs_x) // 2, (ls_y + rs_y) // 2),
-        "abdomen": ((lh_x + rh_x) // 2, (lh_y + rh_y) // 2),
-        "hips": ((lh_x + rh_x) // 2, max(lh_y, rh_y)),
+        "chest":          ((ls_x + rs_x) // 2, (ls_y + rs_y) // 2),
+        "abdomen":        ((lh_x + rh_x) // 2, (lh_y + rh_y) // 2),
+        "hips":           ((lh_x + rh_x) // 2, max(lh_y, rh_y)),
     }
-
     for area_key, (cx, cy) in area_definitions.items():
-        area_rect = _clamp_rect(
-            cx - area_half,
-            cy - area_half,
-            cx + area_half,
-            cy + area_half,
-            w,
-            h,
-        )
+        area_rect = _clamp_rect(cx - area_half, cy - area_half,
+                                cx + area_half, cy + area_half, w, h)
         exposure_tracker[area_key]["total"] += 1
         if is_region_guarded(area_rect):
             exposure_tracker[area_key]["covered"] += 1
 
-# Create window and remove decorations (title bar, buttons) to make it non-movable
+
 WINDOW_NAME = "Mediapipe Feed (Press q to quit)"
 if SHOW_DISPLAY:
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.waitKey(1)  # Let the window initialize
+    cv2.waitKey(1)
 
 if SHOW_DISPLAY and sys.platform == "win32":
-    # Windows API constants
-    GWL_STYLE = -16
-    WS_CAPTION = 0x00C00000
-    WS_THICKFRAME = 0x00040000
-    WS_MINIMIZEBOX = 0x00020000
-    WS_MAXIMIZEBOX = 0x00010000
-    WS_SYSMENU = 0x00080000
+    GWL_STYLE    = -16
+    WS_CAPTION      = 0x00C00000
+    WS_THICKFRAME   = 0x00040000
+    WS_MINIMIZEBOX  = 0x00020000
+    WS_MAXIMIZEBOX  = 0x00010000
+    WS_SYSMENU      = 0x00080000
 
-    # Find the window handle and modify its style
     hwnd = ctypes.windll.user32.FindWindowW(None, WINDOW_NAME)
     if hwnd:
         try:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
-
         screen_w = ctypes.windll.user32.GetSystemMetrics(0)
         screen_h = ctypes.windll.user32.GetSystemMetrics(1)
-
         style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
         style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)
         ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
-
-        # Force fullscreen placement to match the full monitor bounds.
         SWP_FRAMECHANGED = 0x0020
-        SWP_NOZORDER = 0x0004
-        SWP_SHOWWINDOW = 0x0040
+        SWP_NOZORDER     = 0x0004
+        SWP_SHOWWINDOW   = 0x0040
         ctypes.windll.user32.SetWindowPos(
-            hwnd,
-            None,
-            0,
-            0,
-            screen_w,
-            screen_h,
-            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW,
-        )
-
+            hwnd, None, 0, 0, screen_w, screen_h,
+            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW)
         cv2.moveWindow(WINDOW_NAME, 0, 0)
         cv2.resizeWindow(WINDOW_NAME, screen_w, screen_h)
         cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
 
 def get_frame():
     ret, frame = cap.read()
@@ -602,11 +618,10 @@ def get_frame():
 
 
 def update_tracker_from_landmarks(tracker_obj, landmarks, frame_w, frame_h):
-    """Feed tracker buffers from already-computed landmarks to avoid duplicate pose processing."""
+    """Feed 2-D pixel coords into the PoseTracker for speed metrics."""
     tracker_obj.frame_index += 1
     if landmarks is None:
         return
-
     coords = {}
     selected = (
         mp_pose.PoseLandmark.RIGHT_ELBOW,
@@ -620,203 +635,123 @@ def update_tracker_from_landmarks(tracker_obj, landmarks, frame_w, frame_h):
             "x": int(lm.x * frame_w),
             "y": int(lm.y * frame_h),
         }
-
-    tracker_obj.coord_buffer.append({
-        "frame": tracker_obj.frame_index,
-        "landmarks": coords,
-    })
+    tracker_obj.coord_buffer.append({"frame": tracker_obj.frame_index, "landmarks": coords})
 
 
 def render_countdown_frame(frame, countdown_value):
-    """Darken frame and draw a large centered countdown number."""
     h, w = frame.shape[:2]
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), thickness=-1)
     dimmed = cv2.addWeighted(overlay, 0.45, frame, 0.55, 0)
-
     countdown_text = str(countdown_value)
-    font = cv2.FONT_HERSHEY_DUPLEX
+    font       = cv2.FONT_HERSHEY_DUPLEX
     font_scale = max(2.0, min(w, h) / 180.0)
-    thickness = max(4, int(font_scale * 2))
+    thickness  = max(4, int(font_scale * 2))
     text_size, _ = cv2.getTextSize(countdown_text, font, font_scale, thickness)
     text_x = (w - text_size[0]) // 2
     text_y = (h + text_size[1]) // 2
-
-    cv2.putText(dimmed, countdown_text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    cv2.putText(dimmed, countdown_text, (text_x, text_y), font, font_scale,
+                (255, 255, 255), thickness, cv2.LINE_AA)
     return dimmed
 
 
 def calibration_checker(frame, landmarks, w, h):
-    """
-    Check if user is positioned correctly based on shoulder width ratio.
-    Returns positioning status and whether calibration is complete.
-    
-    - Shoulders too close: ratio > 0.30 (user too close to camera)
-    - Shoulders too far: ratio < 0.15 (user too far from camera)
-    - Correct position: 0.15 <= ratio <= 0.30
-    """
     if landmarks is None:
         return frame, None, 0, "", (128, 128, 128)
-    
     try:
-        left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+        left_shoulder  = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
         right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
-        
-        # Calculate shoulder positions in pixels
-        left_x = int(left_shoulder.x * w)
+        left_x  = int(left_shoulder.x  * w)
         right_x = int(right_shoulder.x * w)
-        
-        # Calculate shoulder width ratio (shoulder distance / frame width)
-        shoulder_distance = abs(right_x - left_x)
-        shoulder_ratio = shoulder_distance / w if w > 0 else 0
-        
-        # Determine positioning status
+        shoulder_ratio = abs(right_x - left_x) / w if w > 0 else 0
         if shoulder_ratio > 0.30:
-            status = "TOO CLOSE"
-            color = (0, 0, 255)  # Red
-            feedback = "Step back"
-        elif shoulder_ratio < 0.15:
-            status = "TOO FAR"
-            color = (0, 165, 255)  # Orange
-            feedback = "Step closer"
-        else:
-            status = "CORRECT POSITION"
-            color = (0, 255, 0)  # Green
-            feedback = "Stay still"
-        
-        return frame, status, shoulder_ratio, feedback, color
-        
+            return frame, "TOO CLOSE", shoulder_ratio, "Step back",    (0, 0, 255)
+        if shoulder_ratio < 0.15:
+            return frame, "TOO FAR",   shoulder_ratio, "Step closer",  (0, 165, 255)
+        return frame, "CORRECT POSITION", shoulder_ratio, "Stay still", (0, 255, 0)
     except (AttributeError, IndexError):
         return frame, None, 0, "", (128, 128, 128)
 
 
 def draw_calibration_frame(frame, status, shoulder_ratio, feedback, color):
-    """Draw calibration feedback on frame."""
     h, w = frame.shape[:2]
-    
-    # Darken frame slightly
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), thickness=-1)
     frame = cv2.addWeighted(overlay, 0.2, frame, 0.8, 0)
-    
-    font = cv2.FONT_HERSHEY_DUPLEX
+    font       = cv2.FONT_HERSHEY_DUPLEX
     font_scale = 1.5
-    thickness = 3
-    
-    # Draw status text
+    thickness  = 3
     if status:
-        status_size, _ = cv2.getTextSize(status, font, font_scale, thickness)
-        status_x = (w - status_size[0]) // 2
-        status_y = h // 3
-        cv2.putText(frame, status, (status_x, status_y), font, font_scale, color, thickness, cv2.LINE_AA)
-    
-    # Draw feedback text
-    feedback_font_scale = 1.2
+        s_size, _ = cv2.getTextSize(status, font, font_scale, thickness)
+        cv2.putText(frame, status, ((w - s_size[0]) // 2, h // 3),
+                    font, font_scale, color, thickness, cv2.LINE_AA)
     if feedback:
-        feedback_size, _ = cv2.getTextSize(feedback, font, feedback_font_scale, thickness)
-        feedback_x = (w - feedback_size[0]) // 2
-        feedback_y = h // 2
-        cv2.putText(frame, feedback, (feedback_x, feedback_y), font, feedback_font_scale, color, thickness, cv2.LINE_AA)
-    
-    # Draw target ratio range
-    range_text = "Optimal: 0.15 - 0.30"
-    ratio_text = f"Current: {shoulder_ratio:.3f}"
-    small_font_scale = 0.8
-    
-    range_size, _ = cv2.getTextSize(range_text, font, small_font_scale, 2)
-    range_x = (w - range_size[0]) // 2
-    range_y = 2 * h // 3
-    cv2.putText(frame, range_text, (range_x, range_y), font, small_font_scale, (200, 200, 200), 2, cv2.LINE_AA)
-    
-    ratio_size, _ = cv2.getTextSize(ratio_text, font, small_font_scale, 2)
-    ratio_x = (w - ratio_size[0]) // 2
-    ratio_y = 2 * h // 3 + 40
-    cv2.putText(frame, ratio_text, (ratio_x, ratio_y), font, small_font_scale, color, 2, cv2.LINE_AA)
-    
+        f_size, _ = cv2.getTextSize(feedback, font, 1.2, thickness)
+        cv2.putText(frame, feedback, ((w - f_size[0]) // 2, h // 2),
+                    font, 1.2, color, thickness, cv2.LINE_AA)
+    for txt, y_frac, c in [
+        (f"Optimal: 0.15 - 0.30", 2/3,       (200, 200, 200)),
+        (f"Current: {shoulder_ratio:.3f}",  2/3, color),
+    ]:
+        s, _ = cv2.getTextSize(txt, font, 0.8, 2)
+        cv2.putText(frame, txt, ((w - s[0]) // 2, int(h * y_frac) + (40 if 'Current' in txt else 0)),
+                    font, 0.8, c, 2, cv2.LINE_AA)
     return frame
 
 
-# --- POSITIONING CALIBRATION LOOP ---
-# Wait for user to position themselves correctly for 2 seconds before starting countdown
+# ── CALIBRATION LOOP ─────────────────────────────────────────────────────────
 correct_position_start = None
-calibration_complete = False
+calibration_complete   = False
 
 while cap.isOpened() and not calibration_complete:
     ret, frame = cap.read()
     if not ret or frame is None:
         continue
-
     frame = cv2.flip(frame, 1)
-    h, w = frame.shape[:2]
-    
-    # Process pose to get landmarks
+    h, w  = frame.shape[:2]
     image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     image.flags.writeable = False
     results = shared_pose.process(image)
     image.flags.writeable = True
-    
     try:
         landmarks = results.pose_landmarks.landmark
     except AttributeError:
         landmarks = None
-    
-    # Check positioning
     _, status, shoulder_ratio, feedback, color = calibration_checker(frame, landmarks, w, h)
-    
-    # Draw pose landmarks
     mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-    
-    # Track time in correct position
     if status == "CORRECT POSITION":
         if correct_position_start is None:
             correct_position_start = time.time()
-        
         time_in_position = time.time() - correct_position_start
-        
-        # Check if user has been in correct position for 2 seconds
         if time_in_position >= 2.0:
             calibration_complete = True
             break
     else:
-        # Reset timer if not in correct position
         correct_position_start = None
         time_in_position = 0
-    
-    # Draw calibration UI
     display_frame = draw_calibration_frame(frame.copy(), status, shoulder_ratio, feedback, color)
-    
-    # Draw timer if in correct position
     if correct_position_start is not None:
         timer_text = f"Get ready: {2.0 - time_in_position:.1f}s"
-        font = cv2.FONT_HERSHEY_DUPLEX
-        timer_size, _ = cv2.getTextSize(timer_text, font, 1.0, 2)
-        timer_x = (w - timer_size[0]) // 2
-        timer_y = h - 50
-        cv2.putText(display_frame, timer_text, (timer_x, timer_y), font, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
-    
+        ts, _ = cv2.getTextSize(timer_text, cv2.FONT_HERSHEY_DUPLEX, 1.0, 2)
+        cv2.putText(display_frame, timer_text, ((w - ts[0]) // 2, h - 50),
+                    cv2.FONT_HERSHEY_DUPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
     show_frame(WINDOW_NAME, display_frame)
-    
     if wait_key(1):
         cap.release()
         cv2.destroyAllWindows()
         quit()
 
-# --- COUNTDOWN TIMER LOOP ---
+# ── COUNTDOWN LOOP ───────────────────────────────────────────────────────────
 countdown_start = time.time()
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret or frame is None:
         continue
-
     elapsed_countdown = time.time() - countdown_start
     remaining = PRESTART_COUNTDOWN_SECONDS - int(elapsed_countdown)
-
     if remaining <= 0:
         break
-
-    countdown_frame = render_countdown_frame(cv2.flip(frame, 1), remaining)
-    show_frame(WINDOW_NAME, countdown_frame)
-
+    show_frame(WINDOW_NAME, render_countdown_frame(cv2.flip(frame, 1), remaining))
     if wait_key(1):
         cap.release()
         cv2.destroyAllWindows()
@@ -824,388 +759,361 @@ while cap.isOpened():
 
 start_time = time.time()
 
-
-
+# ── MAIN GAME LOOP ───────────────────────────────────────────────────────────
 while cap.isOpened():
-        actual_fps = cap.get(cv2.CAP_PROP_FPS)
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            continue  # skip this iteration and try again
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        continue
 
-        now = time.time()
-        elapsed = now - start_time
+    now     = time.time()
+    elapsed = now - start_time
 
-        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image.flags.writeable = False
+    results = shared_pose.process(image)
+    image.flags.writeable = True
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-        image.flags.writeable = False
+    mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+    h, w = image.shape[:2]
 
-        results = shared_pose.process(image)
-        
-        image.flags.writeable = True
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    # 2-D landmarks for collision / display / speed
+    try:
+        landmarks = results.pose_landmarks.landmark
+    except AttributeError:
+        landmarks = None
 
-        mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-        h, w = image.shape[:2]
+    # World landmarks for model inference — normalise and buffer every frame
+    try:
+        world_norm = normalize_skeleton(results.pose_world_landmarks.landmark)
+        world_frame_buffer.append(world_norm)
+    except AttributeError:
+        pass   # no pose detected this frame
 
-        try:
-            landmarks = results.pose_landmarks.landmark
-        except AttributeError:
-            landmarks = None
+    update_tracker_from_landmarks(tracker, landmarks, w, h)
 
-        update_tracker_from_landmarks(tracker, landmarks, w, h)
+    if TARGET_CENTER is None and landmarks is not None and now >= next_target_spawn_ts:
+        TARGET_CENTER    = respawn_target(landmarks, w, h, TARGET_RADIUS)
+        CURRENT_TYPE     = choose_punch_type()
+        TARGET_GLOVE_KEY = choose_target_glove_key(CURRENT_TYPE)
+        print(CURRENT_TYPE)
+        last_spawn_ts, circle_spawn_ts, protect_release_ts = _get_spawn_timing(now, SPAWN_PROTECT_S)
 
-        
+    collide   = False
+    protecting = protect_release_ts is not None and now < protect_release_ts
+    if landmarks is not None and TARGET_CENTER is not None and not protecting:
+        collide = wrists_hit_circle(landmarks, w, h, TARGET_CENTER, TARGET_RADIUS)
 
-        if TARGET_CENTER is None and landmarks is not None:
-            TARGET_CENTER = respawn_target(landmarks, w, h, TARGET_RADIUS)
-            CURRENT_TYPE = choose_punch_type()
-            TARGET_GLOVE_KEY = choose_target_glove_key(CURRENT_TYPE)
-            print(CURRENT_TYPE)
-            last_spawn_ts, circle_spawn_ts, protect_release_ts = _get_spawn_timing(now, SPAWN_PROTECT_S)
+    if not protecting and collide:
+        reference_time = circle_spawn_ts if circle_spawn_ts is not None else protect_release_ts
+        reaction_time  = now - reference_time
 
-        collide = False
-        protecting = protect_release_ts is not None and now < protect_release_ts
-        if landmarks is not None and TARGET_CENTER is not None and not protecting:
-            collide = wrists_hit_circle(landmarks, w, h, TARGET_CENTER, TARGET_RADIUS)
-        
-        if not protecting and collide:
-            reference_time = circle_spawn_ts if circle_spawn_ts is not None else protect_release_ts
-            reaction_time = now - reference_time
+        reaction_time_punch[CURRENT_TYPE].append(reaction_time)
+        window_idx = _get_time_window_index(elapsed)
+        if window_idx is not None:
+            reaction_time_windows[window_idx][CURRENT_TYPE].append(reaction_time)
+            reaction_window_combined[window_idx].append(reaction_time)
 
-            reaction_time_punch[CURRENT_TYPE].append(reaction_time)
-
-            window_idx = _get_time_window_index(elapsed)
-
+        raw_coords  = tracker.get_last_fifteen_coords()
+        speed_value = _compute_speed_value(raw_coords, actual_fps)
+        if speed_value is not None:
+            speed_by_type[CURRENT_TYPE].append(speed_value)
             if window_idx is not None:
-                reaction_time_windows[window_idx][CURRENT_TYPE].append(reaction_time)
-                reaction_window_combined[window_idx].append(reaction_time)
+                speed_windows[window_idx][CURRENT_TYPE].append(speed_value)
+                speed_window_combined[window_idx].append(speed_value)
 
-            raw_coords = tracker.get_last_fifteen_coords()
-            fps_value = actual_fps if actual_fps and actual_fps > 0 else 30.0
-            speed_value = _compute_speed_value(raw_coords, fps_value)
-            if speed_value is not None:
-                speed_by_type[CURRENT_TYPE].append(speed_value)
+        # ── Model inference ──────────────────────────────────────────────────
+        predicted_punch = None
+        confidence      = None
+        is_confident    = False
+
+        clip = extract_live_clip(list(world_frame_buffer), actual_fps)
+        if clip is not None:
+            tensor = build_tensor(clip)                       # (7, CLIP_FRAMES, 4, 3)
+            inp    = torch.tensor(tensor, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                logits = model(inp)
+                probs  = torch.softmax(logits, dim=1)[0]
+                pred_class = int(probs.argmax().item())
+                confidence = float(probs[pred_class].item())
+
+            predicted_punch = CLASS_NAMES[pred_class]
+            attempts_by_type[CURRENT_TYPE] += 1
+            punches_thrown += 1
+            if window_idx is not None:
+                accuracy_windows[window_idx]["attempts"] += 1
+
+            is_confident = confidence >= MODEL_CONF_THRESHOLD
+            # Map model name ('lead-hook') → target name ('hook') for accuracy tracking
+            mapped_punch = MODEL_TO_TARGET.get(predicted_punch, predicted_punch)
+            if is_confident and mapped_punch == CURRENT_TYPE:
+                correct_punches_thrown += 1
+                correct_by_type[CURRENT_TYPE] += 1
                 if window_idx is not None:
-                    speed_windows[window_idx][CURRENT_TYPE].append(speed_value)
-                    speed_window_combined[window_idx].append(speed_value)
+                    accuracy_windows[window_idx]["correct"] += 1
 
-            coords = tracker.get_last_normalized_coords()
-            predicted_punch = None
-            confidence = None
-            is_confident = False
-            if coords and len(coords) >= MODEL_SEQUENCE_FRAMES:
-                # Flatten and normalize like in training
-                recent_coords = coords[-MODEL_SEQUENCE_FRAMES:]
-                features = _flatten_normalized_features(recent_coords)
-                expected_feature_count = MODEL_SEQUENCE_FRAMES * LANDMARK_FEATURES_PER_FRAME
+            probs_dict      = {CLASS_NAMES[i]: round(float(probs[i].item()), 3)
+                               for i in range(N_CLASSES)}
+            confidence_flag = "" if is_confident else " ⚠️ low-conf"
+            print(f"Model Logits: {logits}")
+            print(f"Predicted Punch: {predicted_punch} ({confidence:.1%}){confidence_flag}")
+            print(f"All probs: {probs_dict}")
+        else:
+            needed_raw = max(2, int(round(CLIP_FRAMES / TARGET_FPS * actual_fps)))
+            print(f"⚠️  Warming up — {len(world_frame_buffer)}/{needed_raw} raw frames buffered "
+                  f"(need {CLIP_FRAMES} frames at {TARGET_FPS} fps after resampling)")
+        # ── End model inference ──────────────────────────────────────────────
 
-                if len(features) == expected_feature_count:
-                    x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
-                    with torch.no_grad():
-                        logits = model(x)
-                        probs = torch.softmax(logits, dim=1)[0]
-                        pred_class = int(probs.argmax().item())
-                        confidence = float(probs[pred_class].item())
+        if predicted_punch is not None and confidence is not None:
+            confidence_flag = "" if is_confident else " ⚠️"
+            prediction_overlay_text  = (f"Predicted: {predicted_punch.title()} "
+                                        f"({confidence:.0%}){confidence_flag}")
+            prediction_overlay_color = (0, 255, 0) if is_confident else (0, 165, 255)
+        else:
+            needed_raw = max(2, int(round(CLIP_FRAMES / TARGET_FPS * actual_fps)))
+            prediction_overlay_text  = f"Warming up ({len(world_frame_buffer)}/{needed_raw} frames)"
+            prediction_overlay_color = (220, 220, 220)
+        prediction_overlay_until = now + PREDICTION_OVERLAY_SECONDS
 
-                    predicted_punch = CLASS_NAMES[pred_class]
-                    attempts_by_type[CURRENT_TYPE] += 1
-                    punches_thrown += 1
-                    if window_idx is not None:
-                        accuracy_windows[window_idx]["attempts"] += 1
-                    # Treat low-confidence predictions as uncertain to avoid
-                    # skewing session accuracy with unreliable classifications.
-                    is_confident = confidence >= MODEL_CONF_THRESHOLD
-                    if is_confident and predicted_punch == CURRENT_TYPE:
-                        correct_punches_thrown += 1
-                        correct_by_type[CURRENT_TYPE] += 1
-                        if window_idx is not None:
-                            accuracy_windows[window_idx]["correct"] += 1
+        TARGET_CENTER = None
+        CURRENT_TYPE = None
+        TARGET_GLOVE_KEY = None
+        next_target_spawn_ts = now + TARGET_RESPAWN_DELAY_S
+        print(f"Next target in {TARGET_RESPAWN_DELAY_S:.1f}s")
+        print(correct_by_type)
+        print(attempts_by_type)
 
-                    probs_dict = {
-                        class_name: round(float(probs[i].item()), 3)
-                        for i, class_name in enumerate(CLASS_NAMES)
-                    }
-                    confidence_flag = "" if is_confident else " ⚠️ low-conf"
-                    print(f"Model Logits: {logits}")
-                    print(f"Predicted Punch: {predicted_punch} ({confidence:.1%}){confidence_flag}")
-                    print(f"All probs: {probs_dict}")
-                else:
-                    print(
-                        f"⚠️ Feature length mismatch: got {len(features)}, "
-                        f"expected {expected_feature_count}"
-                    )
+    if TARGET_CENTER is not None and CURRENT_TYPE is not None:
+        glove_image = glove_images.get(TARGET_GLOVE_KEY)
+        if glove_image is not None:
+            draw_target_glove(image, TARGET_CENTER, TARGET_RADIUS, glove_image, TARGET_GLOVE_KEY)
+        else:
+            color = PUNCH_COLORS.get(CURRENT_TYPE, (0, 0, 255))
+            cv2.circle(image, TARGET_CENTER, TARGET_RADIUS, color, -1)
 
-            if predicted_punch is not None and confidence is not None:
-                confidence_flag = "" if is_confident else " ⚠️"
-                prediction_overlay_text = f"Predicted: {predicted_punch.title()} ({confidence:.0%}){confidence_flag}"
-                prediction_overlay_color = (0, 255, 0) if is_confident else (0, 165, 255)
-            else:
-                prediction_overlay_text = f"Predicted: Warming up ({MODEL_SEQUENCE_FRAMES} frames)"
-                prediction_overlay_color = (220, 220, 220)
-            prediction_overlay_until = now + PREDICTION_OVERLAY_SECONDS
+    defense_game.update(image, landmarks, now)
+    display_image = cv2.flip(image, 1)
 
-            TARGET_CENTER = respawn_target(landmarks, w, h, TARGET_RADIUS)
-            CURRENT_TYPE = choose_punch_type()
-            TARGET_GLOVE_KEY = choose_target_glove_key(CURRENT_TYPE)
-            print(CURRENT_TYPE, "<-----")
-            print(correct_by_type)
-            print(attempts_by_type)
-            last_spawn_ts, circle_spawn_ts, protect_release_ts = _get_spawn_timing(now, SPAWN_PROTECT_S)
-        
-        if TARGET_CENTER is not None and CURRENT_TYPE is not None:
-            glove_image = glove_images.get(TARGET_GLOVE_KEY)
-            if glove_image is not None:
-                draw_target_glove(image, TARGET_CENTER, TARGET_RADIUS, glove_image, TARGET_GLOVE_KEY)
-            else:
-                # Fallback if an expected punchpad image is missing.
-                color = PUNCH_COLORS.get(CURRENT_TYPE, (0, 0, 255))
-                cv2.circle(image, TARGET_CENTER, TARGET_RADIUS, color, -1)
+    if prediction_overlay_text and now <= prediction_overlay_until:
+        overlay_font      = cv2.FONT_HERSHEY_DUPLEX
+        overlay_scale     = 1.0
+        overlay_thickness = 2
+        text_size, _ = cv2.getTextSize(prediction_overlay_text,
+                                       overlay_font, overlay_scale, overlay_thickness)
+        text_x = max((display_image.shape[1] - text_size[0]) // 2, 10)
+        text_y = max(int(display_image.shape[0] * 0.1), text_size[1] + 16)
+        pad = 12
+        cv2.rectangle(display_image,
+                      (text_x - pad, text_y - text_size[1] - pad),
+                      (text_x + text_size[0] + pad, text_y + pad),
+                      (0, 0, 0), -1)
+        cv2.rectangle(display_image,
+                      (text_x - pad, text_y - text_size[1] - pad),
+                      (text_x + text_size[0] + pad, text_y + pad),
+                      prediction_overlay_color, 2)
+        cv2.putText(display_image, prediction_overlay_text, (text_x, text_y),
+                    overlay_font, overlay_scale, prediction_overlay_color,
+                    overlay_thickness, cv2.LINE_AA)
 
-        defense_game.update(image, landmarks, now)
+    show_frame(WINDOW_NAME, display_image)
+    if wait_key(1):
+        break
+    if elapsed >= MAX_RUNTIME:
+        break
 
-        display_image = cv2.flip(image, 1)
 
-        if prediction_overlay_text and now <= prediction_overlay_until:
-            overlay_font = cv2.FONT_HERSHEY_DUPLEX
-            overlay_scale = 1.0
-            overlay_thickness = 2
-            text_size, _ = cv2.getTextSize(prediction_overlay_text, overlay_font, overlay_scale, overlay_thickness)
-            text_x = max((display_image.shape[1] - text_size[0]) // 2, 10)
-            text_y = max(int(display_image.shape[0] * 0.1), text_size[1] + 16)
-            pad = 12
-
-            cv2.rectangle(
-                display_image,
-                (text_x - pad, text_y - text_size[1] - pad),
-                (text_x + text_size[0] + pad, text_y + pad),
-                (0, 0, 0),
-                -1,
-            )
-            cv2.rectangle(
-                display_image,
-                (text_x - pad, text_y - text_size[1] - pad),
-                (text_x + text_size[0] + pad, text_y + pad),
-                prediction_overlay_color,
-                2,
-            )
-            cv2.putText(
-                display_image,
-                prediction_overlay_text,
-                (text_x, text_y),
-                overlay_font,
-                overlay_scale,
-                prediction_overlay_color,
-                overlay_thickness,
-                cv2.LINE_AA,
-            )
-
-        show_frame(WINDOW_NAME, display_image)
-
-        if wait_key(1):
-            break
-        if elapsed >= MAX_RUNTIME:
-            break
-
+# ── Session metrics ──────────────────────────────────────────────────────────
 all_reaction_times = [t for times in reaction_time_punch.values() for t in times]
+
 
 def round_or_none(value, digits=2):
     return round(value, digits) if value is not None else None
 
+
 reaction_types_ms = {}
 for punch_type, times in reaction_time_punch.items():
-    if times:
-        avg_ms = (sum(times) / len(times)) * 1000
-        reaction_types_ms[punch_type] = round_or_none(avg_ms)
-    else:
-        reaction_types_ms[punch_type] = None
+    reaction_types_ms[punch_type] = (
+        round_or_none((sum(times) / len(times)) * 1000) if times else None
+    )
 
 reaction_all_points_ms = []
 for window_times in reaction_window_combined:
-    if window_times:
-        avg_ms = (sum(window_times) / len(window_times)) * 1000
-        reaction_all_points_ms.append(round_or_none(avg_ms))
-    else:
-        reaction_all_points_ms.append(None)
+    reaction_all_points_ms.append(
+        round_or_none((sum(window_times) / len(window_times)) * 1000)
+        if window_times else None
+    )
 
 if all_reaction_times:
     reaction_average_ms = round_or_none((sum(all_reaction_times) / len(all_reaction_times)) * 1000)
-    reaction_best_ms = round_or_none(min(all_reaction_times) * 1000)
-    reaction_worst_ms = round_or_none(max(all_reaction_times) * 1000)
+    reaction_best_ms    = round_or_none(min(all_reaction_times) * 1000)
+    reaction_worst_ms   = round_or_none(max(all_reaction_times) * 1000)
 else:
     reaction_average_ms = reaction_best_ms = reaction_worst_ms = None
 
 accuracy_types = {}
-for punch_type in reaction_time_punch.keys():
+for punch_type in reaction_time_punch:
     attempts = attempts_by_type[punch_type]
-    correct = correct_by_type[punch_type]
-    if attempts:
-        accuracy_types[punch_type] = round_or_none((correct / attempts) * 100)
-    else:
-        accuracy_types[punch_type] = None
+    correct  = correct_by_type[punch_type]
+    accuracy_types[punch_type] = (
+        round_or_none((correct / attempts) * 100) if attempts else None
+    )
 
 window_accuracy_points = []
 for window in accuracy_windows:
-    if window["attempts"]:
-        window_accuracy_points.append(round_or_none((window["correct"] / window["attempts"]) * 100))
-    else:
-        window_accuracy_points.append(None)
+    window_accuracy_points.append(
+        round_or_none((window["correct"] / window["attempts"]) * 100)
+        if window["attempts"] else None
+    )
 
-if punches_thrown:
-    overall_accuracy_percent = round_or_none((correct_punches_thrown / punches_thrown) * 100)
-else:
-    overall_accuracy_percent = None
+overall_accuracy_percent = (
+    round_or_none((correct_punches_thrown / punches_thrown) * 100)
+    if punches_thrown else None
+)
 
 valid_accuracy_points = [pt for pt in window_accuracy_points if pt is not None]
-if valid_accuracy_points:
-    accuracy_best = max(valid_accuracy_points)
-    accuracy_worst = min(valid_accuracy_points)
-else:
-    accuracy_best = accuracy_worst = None
+accuracy_best  = max(valid_accuracy_points) if valid_accuracy_points else None
+accuracy_worst = min(valid_accuracy_points) if valid_accuracy_points else None
 
 all_speeds = [s for values in speed_by_type.values() for s in values]
 
 speed_types = {}
 for punch_type, values in speed_by_type.items():
-    if values:
-        speed_types[punch_type] = round_or_none(sum(values) / len(values))
-    else:
-        speed_types[punch_type] = None
+    speed_types[punch_type] = (
+        round_or_none(sum(values) / len(values)) if values else None
+    )
 
 speed_all_points = []
 for window_values in speed_window_combined:
-    if window_values:
-        speed_all_points.append(round_or_none(sum(window_values) / len(window_values)))
-    else:
-        speed_all_points.append(None)
+    speed_all_points.append(
+        round_or_none(sum(window_values) / len(window_values))
+        if window_values else None
+    )
 
 if all_speeds:
     speed_average = round_or_none(sum(all_speeds) / len(all_speeds))
-    speed_best = round_or_none(max(all_speeds))
-    speed_worst = round_or_none(min(all_speeds))
+    speed_best    = round_or_none(max(all_speeds))
+    speed_worst   = round_or_none(min(all_speeds))
 else:
     speed_average = speed_best = speed_worst = None
 
 speed_segments = {
-    "first_third": speed_all_points[0],
+    "first_third":  speed_all_points[0],
     "second_third": speed_all_points[1],
-    "final_third": speed_all_points[2],
+    "final_third":  speed_all_points[2],
 }
 
-defense_totals = defense_game.get_stats()
+defense_totals       = defense_game.get_stats()
 defense_total_events = sum(defense_totals.values())
-if defense_total_events:
-    punches_avoided_percent = round_or_none(
+punches_avoided_percent = (
+    round_or_none(
         ((defense_totals["blocked"] + defense_totals["dodged"]) / defense_total_events) * 100
-    )
-else:
-    punches_avoided_percent = None
+    ) if defense_total_events else None
+)
 
 critical_hit_percentages = {}
 for area_key, stats in coverage_tracker.items():
-    if stats["total"]:
-        uncovered_pct = ((stats["total"] - stats["covered"]) / stats["total"]) * 100
-        critical_hit_percentages[area_key] = round_or_none(uncovered_pct)
-    else:
-        critical_hit_percentages[area_key] = None
+    critical_hit_percentages[area_key] = (
+        round_or_none(((stats["total"] - stats["covered"]) / stats["total"]) * 100)
+        if stats["total"] else None
+    )
 
 exposure_weights_values = {}
 for area_key, stats in exposure_tracker.items():
-    if stats["total"]:
-        exposed_ratio = (stats["total"] - stats["covered"]) / stats["total"]
-        exposure_weights_values[area_key] = round_or_none(exposed_ratio)
-    else:
-        exposure_weights_values[area_key] = None
+    exposure_weights_values[area_key] = (
+        round_or_none((stats["total"] - stats["covered"]) / stats["total"])
+        if stats["total"] else None
+    )
 
 endurance_segments = {
-    "first_third": round_or_none(window_accuracy_points[0]) if len(window_accuracy_points) > 0 else None,
+    "first_third":  round_or_none(window_accuracy_points[0]) if len(window_accuracy_points) > 0 else None,
     "second_third": round_or_none(window_accuracy_points[1]) if len(window_accuracy_points) > 1 else None,
-    "final_third": round_or_none(window_accuracy_points[2]) if len(window_accuracy_points) > 2 else None,
+    "final_third":  round_or_none(window_accuracy_points[2]) if len(window_accuracy_points) > 2 else None,
 }
 
-fighter_id = "fighter_sample_001"
-session_id = f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+fighter_id    = "fighter_sample_001"
+session_id    = f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 timestamp_iso = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 session_payload = [{
-    "fighter_id": fighter_id,
-    "session_id": session_id,
-    "timestamp": timestamp_iso,
-    "punches_thrown": punches_thrown,
+    "fighter_id":      fighter_id,
+    "session_id":      session_id,
+    "timestamp":       timestamp_iso,
+    "punches_thrown":  punches_thrown,
     "correct_punches": correct_punches_thrown,
     "metrics": {
         "offense": {
             "punch_accuracy": {
-                "unit": "%",
+                "unit":  "%",
                 "types": accuracy_types,
                 "derived": {
-                    "average": overall_accuracy_percent,
+                    "average":             overall_accuracy_percent,
                     "average_description": "Average of all recorded punch accuracies across the session.",
-                    "best": accuracy_best,
-                    "worst": accuracy_worst,
-                    "all_points": window_accuracy_points
-                }
+                    "best":                accuracy_best,
+                    "worst":               accuracy_worst,
+                    "all_points":          window_accuracy_points,
+                },
             },
             "punch_reaction_time": {
-                "unit": "ms",
+                "unit":  "ms",
                 "types": reaction_types_ms,
                 "derived": {
-                    "average": reaction_average_ms,
+                    "average":             reaction_average_ms,
                     "average_description": "Average reaction time, in milliseconds, measured across all punches.",
-                    "best": reaction_best_ms,
-                    "worst": reaction_worst_ms,
-                    "all_points": reaction_all_points_ms,
-                    "all_points_description": "Reaction time averages for each 10-second segment of the session."
-                }
+                    "best":                reaction_best_ms,
+                    "worst":              reaction_worst_ms,
+                    "all_points":          reaction_all_points_ms,
+                    "all_points_description": "Reaction time averages for each 10-second segment of the session.",
+                },
             },
             "punch_speed": {
-                "unit": "px/s",
+                "unit":  "px/s",
                 "types": speed_types,
                 "derived": {
-                    "average": speed_average,
+                    "average":             speed_average,
                     "average_description": "Mean punch speed across all punch types during the session.",
-                    "best": speed_best,
-                    "worst": speed_worst,
-                    "all_points": speed_all_points,
+                    "best":                speed_best,
+                    "worst":               speed_worst,
+                    "all_points":          speed_all_points,
                     "combo_tempo": {
-                        "unit": "px/s",
-                        "segments": speed_segments,
-                        "description": "Average punch speed per 10-second segment of the session."
-                    }
-                }
-            }
+                        "unit":        "px/s",
+                        "segments":    speed_segments,
+                        "description": "Average punch speed per 10-second segment of the session.",
+                    },
+                },
+            },
         },
         "defense": {
             "critical_hit_opportunities": {
-                "unit": "% of body",
+                "unit":  "% of body",
                 "areas": {
                     "head": critical_hit_percentages.get("head"),
                     "body": critical_hit_percentages.get("body"),
-                }
+                },
             },
             "exposure_weights": {
-                "unit": "relative_weight_0_to_1",
-                "description": "Relative weighting (0–1) showing how exposed each body area was across all sampled frames.",
-                "areas": exposure_weights_values,
+                "unit":        "relative_weight_0_to_1",
+                "description": "Relative weighting (0–1) showing how exposed each body area was.",
+                "areas":       exposure_weights_values,
             },
             "endurance": {
-                "unit": "%",
-                "description": "Average accuracy over each third of the session, representing endurance and fatigue levels.",
-                "segments": endurance_segments,
+                "unit":        "%",
+                "description": "Average accuracy over each third of the session.",
+                "segments":    endurance_segments,
             },
             "punches_avoided": {
-                "unit": "%",
-                "value": punches_avoided_percent,
-                "description": "Percentage of incoming targets that were blocked or dodged."
-            }
+                "unit":        "%",
+                "value":       punches_avoided_percent,
+                "description": "Percentage of incoming targets that were blocked or dodged.",
+            },
         },
         "miscellaneous": {
             "flying_blocks_summary": {
-                "unit": "count",
-                "values": defense_totals,
-                "description": "Counts of block, dodge, and hit outcomes from the flying blocks drill."
-            }
-        }
-    }
+                "unit":        "count",
+                "values":      defense_totals,
+                "description": "Counts of block, dodge, and hit outcomes from the flying blocks drill.",
+            },
+        },
+    },
 }]
 
 with open("session_metrics.json", "w", encoding="utf-8") as metric_file:
@@ -1214,9 +1122,7 @@ with open("session_metrics.json", "w", encoding="utf-8") as metric_file:
 print("Session metrics written to session_metrics.json")
 print(
     "Defense stats - Blocked: {blocked}, Dodged: {dodged}, Hit: {hit}".format(
-        blocked=defense_totals["blocked"],
-        dodged=defense_totals["dodged"],
-        hit=defense_totals["hit"],
+        **defense_totals
     )
 )
 

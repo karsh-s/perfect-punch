@@ -67,9 +67,13 @@ def respawn_target(landmarks, w, h, target_radius):
     xmin = max(target_radius, min(lsx, rsx) - shoulder_width)
     xmax = min(w - target_radius, max(lsx, rsx) + shoulder_width)
 
+    shoulder_y = (lsy + rsy) // 2
     waist_y = (lhy + rhy) // 2
-    ymin = max(target_radius, min(ny, waist_y))
-    ymax = min(h - target_radius, max(ny, waist_y))
+
+    # Keep targets in the upper body: do not allow spawns lower than mid-chest.
+    mid_chest_floor_y = shoulder_y + ((waist_y - shoulder_y) // 2)
+    ymin = max(target_radius, min(ny, shoulder_y))
+    ymax = min(h - target_radius, max(ny, mid_chest_floor_y))
 
     if xmax <= xmin or ymax <= ymin:
         return None

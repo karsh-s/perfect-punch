@@ -44,16 +44,20 @@ except ImportError:
 SHOW_DISPLAY = os.getenv('SHOW_DISPLAY', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 # ── Model / pipeline constants (must match training config) ─────────────────
-CLIP_FRAMES          = 50          # frames per clip at TARGET_FPS
-TARGET_FPS           = 60          # resample target (training standard)
+CLIP_FRAMES          = 50
+TARGET_FPS           = 60
 WORLD_BUFFER_FRAMES  = 150         # raw-FPS rolling buffer (~5 s at 30 fps)
-VEL_WINDOW           = 7           # velocity smoothing kernel
-VELOCITY_LM          = [11, 12, 13, 14, 15, 16]  # landmarks for compound velocity
+VEL_WINDOW           = 7
+VELOCITY_LM          = [11, 12, 13, 14, 15, 16]
 MODEL_CONF_THRESHOLD = 0.55
 CLASS_NAMES          = ('jab', 'lead-hook', 'rear-uppercut')
 N_CLASSES            = len(CLASS_NAMES)
 
-# Maps model output names → target_utils punch type names used by choose_punch_type()
+# How many seconds of raw frames to search for the velocity peak at collision.
+# 2.5 s at 30 fps = 75 raw frames -> resampled to 150 @ 60 fps, plenty for
+# a 50-frame clip.  Short enough that stale punches don't pollute the peak.
+LOOK_BACK_SECONDS = 2.5
+
 MODEL_TO_TARGET = {
     'jab':           'jab',
     'lead-hook':     'hook',
@@ -132,7 +136,7 @@ def _compute_speed_value(raw_coords, fps_value):
     return sum(top_speeds) / len(top_speeds)
 
 
-# ── Skeleton preprocessing (identical to training pipeline) ─────────────────
+# ── Skeleton preprocessing (identical to notebook pipeline) ─────────────────
 
 def normalize_skeleton(lm_list):
     """Hip-centred, shoulder-width-normalised. Returns (33, 4)."""
@@ -253,19 +257,26 @@ def build_tensor(clip):
 
 def extract_live_clip(raw_frames, src_fps):
     """
-    Adapt extract_best_clip for a live rolling buffer.
-    raw_frames : list of (33, 4) arrays at native camera FPS
+    Matches extract_best_clip from the notebook exactly.
+
+    raw_frames must already be pre-sliced to only the frames captured since
+    the current target spawned (see spawn_buf_len logic in the main loop).
+    This ensures the velocity peak search covers only the current punch,
+    the same way the notebook processes one video per punch.
+
     Returns (CLIP_FRAMES, 33, 4) float32, or None if not enough data.
     """
     if len(raw_frames) < 2:
         return None
 
+    # Step 1: resample to TARGET_FPS
     resampled = resample_frames(raw_frames, src_fps, TARGET_FPS)
     n = len(resampled)
+
     if n < CLIP_FRAMES:
         return None
 
-    # Compute smoothed compound velocity on the resampled sequence
+    # Step 2: compute smoothed compound velocity on the resampled sequence
     all_vels = [0.0]
     for i in range(1, n):
         all_vels.append(compound_velocity(resampled[i], resampled[i - 1]))
@@ -273,10 +284,14 @@ def extract_live_clip(raw_frames, src_fps):
     kernel = np.ones(VEL_WINDOW) / VEL_WINDOW
     smooth = np.convolve(vels, kernel, mode='same')
 
-    # Peak restricted so full window fits in bounds
+    # Step 3: find velocity peak — window must fit fully in bounds
     min_peak = CLIP_FRAMES - 1
     max_peak = n - 1
-    peak     = int(np.argmax(smooth[min_peak:max_peak + 1])) + min_peak
+
+    if min_peak > max_peak:
+        peak = max_peak
+    else:
+        peak = int(np.argmax(smooth[min_peak:max_peak + 1])) + min_peak
 
     end   = peak + 1
     start = end - CLIP_FRAMES
@@ -321,7 +336,7 @@ class Conv2Plus1DBlock(nn.Module):
 class PerfectPunchCNN(nn.Module):
     """
     6-block (2+1)D CNN for skeleton punch classification.
-    Input:  (B, 7, T, 4, 3)  — 7 channels, T=CLIP_FRAMES frames, 4 arm joints, 3 coords
+    Input:  (B, 7, T, 4, 3)
     Output: (B, num_classes)
     """
     def __init__(self, num_classes=N_CLASSES, in_channels=7, base_ch=32, dropout=0.4):
@@ -348,7 +363,7 @@ class PerfectPunchCNN(nn.Module):
             nn.Linear(base_ch * 8, num_classes),
         )
 
-    def forward(self, x):   # x: (B, 7, T, 4, 3)
+    def forward(self, x):
         x = self.stem(x)
         x = self.layer1(x)
         x = self.layer2(x)
@@ -409,7 +424,6 @@ def _load_camera():
 
 
 def _load_torch_model():
-    """Load PerfectPunchCNN checkpoint."""
     m = PerfectPunchCNN(num_classes=N_CLASSES)
     m.load_state_dict(
         torch.load("perfectpunch_backend/models/best_punch_model.pt", map_location="cpu")
@@ -440,17 +454,13 @@ if not cap or not cap.isOpened():
     print("FATAL: Camera failed to initialize.")
     exit(1)
 
-# Read camera FPS once — used by resampler and speed metrics
 actual_fps = cap.get(cv2.CAP_PROP_FPS)
 if not actual_fps or actual_fps <= 0:
     actual_fps = 30.0
 print(f"Camera FPS: {actual_fps:.1f}")
 
 # ── Tracker and world-landmark buffer ───────────────────────────────────────
-# PoseTracker: holds 2-D pixel coords used for px/s speed metric
 tracker = PoseTracker(max_frames=WORLD_BUFFER_FRAMES, pose=shared_pose)
-
-# Rolling buffer of (33, 4) world-landmark frames fed into the model pipeline
 world_frame_buffer: deque = deque(maxlen=WORLD_BUFFER_FRAMES)
 
 glove_images = {
@@ -468,6 +478,12 @@ last_spawn_ts    = 0.0
 circle_spawn_ts  = None
 protect_release_ts = None
 next_target_spawn_ts = 0.0
+# Tracks how many frames were in world_frame_buffer when the current target
+# spawned.  At collision we slice [spawn_buf_len:] so only frames from the
+# current punch are fed to extract_live_clip — matching the notebook which
+# processes exactly one video (one punch) per clip.
+spawn_buf_len    = 0
+
 MAX_RUNTIME                 = 30
 PRESTART_COUNTDOWN_SECONDS  = 3
 PREDICTION_OVERLAY_SECONDS  = 1.8
@@ -618,7 +634,6 @@ def get_frame():
 
 
 def update_tracker_from_landmarks(tracker_obj, landmarks, frame_w, frame_h):
-    """Feed 2-D pixel coords into the PoseTracker for speed metrics."""
     tracker_obj.frame_index += 1
     if landmarks is None:
         return
@@ -777,18 +792,17 @@ while cap.isOpened():
     mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
     h, w = image.shape[:2]
 
-    # 2-D landmarks for collision / display / speed
     try:
         landmarks = results.pose_landmarks.landmark
     except AttributeError:
         landmarks = None
 
-    # World landmarks for model inference — normalise and buffer every frame
+    # World landmarks: normalise and buffer every frame
     try:
         world_norm = normalize_skeleton(results.pose_world_landmarks.landmark)
         world_frame_buffer.append(world_norm)
     except AttributeError:
-        pass   # no pose detected this frame
+        pass
 
     update_tracker_from_landmarks(tracker, landmarks, w, h)
 
@@ -798,6 +812,9 @@ while cap.isOpened():
         TARGET_GLOVE_KEY = choose_target_glove_key(CURRENT_TYPE)
         print(CURRENT_TYPE)
         last_spawn_ts, circle_spawn_ts, protect_release_ts = _get_spawn_timing(now, SPAWN_PROTECT_S)
+        # Record buffer length at spawn so we can slice only frames from
+        # this punch when running inference at collision time.
+        spawn_buf_len = len(world_frame_buffer)
 
     collide   = False
     protecting = protect_release_ts is not None and now < protect_release_ts
@@ -827,7 +844,21 @@ while cap.isOpened():
         confidence      = None
         is_confident    = False
 
-        clip = extract_live_clip(list(world_frame_buffer), actual_fps)
+        # Slice to only the frames captured since this target spawned.
+        # This mirrors the notebook, which processes exactly one video
+        # (one punch) per clip — ensuring the velocity peak search finds
+        # the current punch, not stale history.
+        _buf = list(world_frame_buffer)
+        punch_frames = _buf[spawn_buf_len:]
+
+        # Safety fallback: if spawn tracking gave us too few frames (e.g.
+        # the buffer wrapped), use a fixed look-back window instead.
+        min_raw = max(2, int(round(LOOK_BACK_SECONDS * actual_fps)))
+        if len(punch_frames) < min_raw:
+            punch_frames = _buf[-min_raw:]
+
+        clip = extract_live_clip(punch_frames, actual_fps)
+
         if clip is not None:
             tensor = build_tensor(clip)                       # (7, CLIP_FRAMES, 4, 3)
             inp    = torch.tensor(tensor, dtype=torch.float32).unsqueeze(0)
@@ -844,7 +875,6 @@ while cap.isOpened():
                 accuracy_windows[window_idx]["attempts"] += 1
 
             is_confident = confidence >= MODEL_CONF_THRESHOLD
-            # Map model name ('lead-hook') → target name ('hook') for accuracy tracking
             mapped_punch = MODEL_TO_TARGET.get(predicted_punch, predicted_punch)
             if is_confident and mapped_punch == CURRENT_TYPE:
                 correct_punches_thrown += 1
@@ -875,9 +905,10 @@ while cap.isOpened():
             prediction_overlay_color = (220, 220, 220)
         prediction_overlay_until = now + PREDICTION_OVERLAY_SECONDS
 
-        TARGET_CENTER = None
-        CURRENT_TYPE = None
+        TARGET_CENTER    = None
+        CURRENT_TYPE     = None
         TARGET_GLOVE_KEY = None
+        spawn_buf_len    = 0
         next_target_spawn_ts = now + TARGET_RESPAWN_DELAY_S
         print(f"Next target in {TARGET_RESPAWN_DELAY_S:.1f}s")
         print(correct_by_type)

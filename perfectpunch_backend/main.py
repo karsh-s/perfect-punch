@@ -6,9 +6,10 @@ from openai import OpenAI
 import os, json, time, subprocess, sys
 from datetime import datetime
 
-# Load environment
+# Load environment variables from .env (if present). Keeps secrets/config out of source.
 load_dotenv()
 
+# Create FastAPI application instance serving the backend API.
 app = FastAPI(title="PerfectPunch API")
 
 # ---- CORS ---
@@ -20,7 +21,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Try loading game router
+# Attempt to load optional in-process game router (provides in-memory game manager).
+# If it fails we fall back to supabase/DB-backed session retrieval paths.
 try:
     from .api.routers import game
     from .api.routers.game import game_manager
@@ -32,19 +34,25 @@ except Exception as e:
     game_manager = None
     print(f"⚠️ Error loading game router: {e}")
 
-# Optional OpenAI setup
+# Optional OpenAI client (used by the feedback/analysis route). Safe to be None.
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
 # -----------------------------
-#  LOCAL SESSION STORAGE ADDED
+# Local session storage
 # -----------------------------
+# A simple local folder where session JSON payloads are saved when uploaded
+# (used by `run_model.py` and for quick local debugging). Created if absent.
 SESSIONS_DIR = "sessions"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 @app.post("/session/upload")
 def upload_session(payload: dict):
-    """Save session data coming from run_model.py."""
+    """Endpoint used by local clients to persist raw session payloads.
+
+    The payload is written to `sessions/` with a timestamped filename and
+    flushed to disk to avoid race conditions on quick uploads.
+    """
     filename = f"{SESSIONS_DIR}/session_{int(time.time())}.json"
     with open(filename, "w") as f:
         json.dump(payload, f)
@@ -56,34 +64,42 @@ def upload_session(payload: dict):
 
 @app.get("/")
 def root():
+    """Health endpoint for quick connectivity checks."""
     return {"status": "backend running 🚀"}
 
 
 # -----------------------------
-#  RUN PUNCH ANALYSIS ENDPOINT
+# Run punch analysis (blocking subprocess)
 # -----------------------------
 @app.post("/analysis/start")
 def start_punch_analysis():
-    """Start the punch analysis camera session."""
+    """Trigger a local analysis run using the camera-based analysis script.
+
+    This endpoint spawns `perfectpunch_backend.main_python_analysis` as a
+    subprocess, waits (short timeout) and then returns the generated
+    `session_metrics.json`. It is intended for local/demo usage where the
+    backend can access a camera. The call is blocking and returns JSON.
+    """
     try:
         print("🎥 Starting punch analysis...")
-        
-        # Run the main_python_analysis script
-        # Use subprocess to run it as a module within the conda environment
-        # Set SHOW_DISPLAY=true to enable camera window
+
+        # Prepare environment: enable on-screen display by default for local runs
         env = os.environ.copy()
         env['SHOW_DISPLAY'] = 'true'
-        
+
+        # Run the analysis module as a separate Python process. Keep the
+        # working directory at the project root so relative paths inside the
+        # analysis script behave as expected.
         result = subprocess.run(
             [sys.executable, "-m", "perfectpunch_backend.main_python_analysis"],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            timeout=120,  # 2 minute timeout
-            env=env,  # Pass the environment with SHOW_DISPLAY=true
+            timeout=120,  # 2 minute timeout to avoid hanging callers
+            env=env,
             capture_output=True,
             text=True,
         )
-        
-        # Check if the script ran successfully
+
+        # If the subprocess printed errors or crashed, return a helpful message
         if result.returncode != 0:
             print(f"❌ Analysis failed with return code {result.returncode}")
             output_lines = []
@@ -103,10 +119,10 @@ def start_punch_analysis():
                 detail += f". Last log: {(preferred or output_lines[-1])}"
 
             raise HTTPException(status_code=500, detail=detail)
-        
+
         print("✅ Analysis completed successfully")
-        
-        # Load and return the results from session_metrics.json
+
+        # Read back the session metrics produced by the analysis script
         metrics_file = "session_metrics.json"
         if os.path.exists(metrics_file):
             with open(metrics_file, "r") as f:
@@ -115,8 +131,9 @@ def start_punch_analysis():
             return {"status": "success", "metrics": metrics}
         else:
             raise HTTPException(status_code=500, detail="session_metrics.json not found")
-            
+
     except subprocess.TimeoutExpired:
+        # Subprocess took too long — notify the caller
         raise HTTPException(status_code=500, detail="Analysis timeout - took too long")
     except Exception as e:
         print(f"❌ Error: {e}")
@@ -128,7 +145,11 @@ def start_punch_analysis():
 # -----------------------------
 @app.get("/analysis/results")
 def get_analysis_results():
-    """Get the latest punch analysis results from session_metrics.json."""
+    """Return the most recent `session_metrics.json` produced by an analysis run.
+
+    This is a convenience read endpoint so clients can poll for results without
+    re-running the analysis process.
+    """
     try:
         metrics_file = "session_metrics.json"
         if os.path.exists(metrics_file):
@@ -146,9 +167,17 @@ def get_analysis_results():
 # -----------------------------
 @app.get("/session/latest")
 def get_latest_session(session_id: str = Query(None, description="Optional session ID to fetch")):
-    """Return the most recent REAL session in dashboard format."""
+    """Return the most recent REAL session formatted for the dashboard.
 
-    # 1️⃣ FIRST: Try loading local saved session files (this is needed for run_model.py!)
+    Resolution order:
+    1. Local `sessions/` folder (useful for offline/dev runs)
+    2. Supabase by `session_id` (if supplied)
+    3. Latest Supabase session
+    4. In-memory GameManager session (if the router is enabled)
+    5. Static demo fallback
+    """
+
+    # 1) Try local saved session files first (for run_model.py local uploads)
     try:
         files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")]
         if files:
@@ -158,18 +187,18 @@ def get_latest_session(session_id: str = Query(None, description="Optional sessi
             with open(path) as f:
                 session_data = json.load(f)
 
-            # Only accept valid sessions
+            # Only accept sessions that contain punches (basic sanity check)
             if session_data.get("total_punches", 0) > 0:
                 print(f"📄 Loaded LOCAL session: {latest}")
                 return session_data
     except Exception as e:
         print("⚠️ Error loading local session:", e)
 
-    # If session_id is provided → try Supabase
+    # 2) If a session_id is provided, try fetching that exact session from Supabase
     if session_id:
         try:
             from perfectpunch_backend.supabase_client import supabase
-            
+
             result = supabase.table("game_sessions").select("*") \
                 .eq("session_id", session_id).order("end_time", desc=True).limit(1).execute()
 
@@ -185,7 +214,7 @@ def get_latest_session(session_id: str = Query(None, description="Optional sessi
         except Exception as e:
             print(f"⚠️ Error fetching from Supabase: {e}")
 
-    # No session_id → try latest Supabase session
+    # 3) Try latest Supabase session if no session_id specified
     if not session_id:
         try:
             from perfectpunch_backend.services.game_session_service import get_latest_session
@@ -196,7 +225,7 @@ def get_latest_session(session_id: str = Query(None, description="Optional sessi
         except Exception as e:
             print(f"⚠️ Error fetching latest Supabase session: {e}")
 
-    # Try in-memory game manager sessions
+    # 4) In-memory GameManager (used by the optional game router)
     if session_id and GAME_MANAGER_AVAILABLE and game_manager:
         stats = game_manager.get_session_stats(session_id)
         session = game_manager.get_session(session_id)
@@ -209,7 +238,7 @@ def get_latest_session(session_id: str = Query(None, description="Optional sessi
                 "punches": [vars(a) for a in session.punch_attempts]
             }
 
-    # ⚠️ FINAL FALLBACK — static demo (only if everything failed)
+    # 5) Final fallback: static demo session (used when no real data is available)
     print("⚠️ Falling back to static demo session.")
     return {
         "session_id": "demo_001",

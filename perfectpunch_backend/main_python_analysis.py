@@ -140,8 +140,7 @@ def _compute_speed_value(raw_coords, fps_value):
 
 def normalize_skeleton(lm_list):
     """Hip-centred, shoulder-width-normalised. Returns (33, 4)."""
-    coords = np.array([[l.x, l.y, l.z, l.visibility] for l in lm_list],
-                      dtype=np.float32)
+    coords = np.array([[l.x, l.y, l.z, l.visibility] for l in lm_list], dtype=np.float32)
     hip_c = (coords[23][:3] + coords[24][:3]) / 2
     coords[:, :3] -= hip_c
     dist = np.linalg.norm(coords[11][:3] - coords[12][:3])
@@ -534,8 +533,7 @@ def update_coverage_metrics(landmarks, w, h):
         return
 
     def get_coords(lm_enum_or_index):
-        lm = landmarks[lm_enum_or_index if isinstance(lm_enum_or_index, int)
-                       else lm_enum_or_index.value]
+        lm = landmarks[lm_enum_or_index if isinstance(lm_enum_or_index, int) else lm_enum_or_index.value]
         return int(lm.x * w), int(lm.y * h)
 
     rw_x, rw_y = get_coords(mp_pose.PoseLandmark.RIGHT_WRIST)
@@ -776,6 +774,7 @@ start_time = time.time()
 
 # ── MAIN GAME LOOP ───────────────────────────────────────────────────────────
 while cap.isOpened():
+    # --- Frame capture ----------------------------------------------------
     ret, frame = cap.read()
     if not ret or frame is None:
         continue
@@ -783,54 +782,70 @@ while cap.isOpened():
     now     = time.time()
     elapsed = now - start_time
 
+    # --- Pose estimation (MediaPipe) -------------------------------------
     image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     image.flags.writeable = False
     results = shared_pose.process(image)
     image.flags.writeable = True
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
+    # Draw skeleton for visualization (does not affect logic)
     mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
     h, w = image.shape[:2]
 
+    # Extract landmark list (or None if detection failed)
     try:
         landmarks = results.pose_landmarks.landmark
     except AttributeError:
         landmarks = None
 
-    # World landmarks: normalise and buffer every frame
+    # --- World-space skeleton buffering ----------------------------------
+    # Keep a rolling buffer of normalized world-space skeletons for clip
+    # extraction and velocity analysis used by the model.
     try:
         world_norm = normalize_skeleton(results.pose_world_landmarks.landmark)
         world_frame_buffer.append(world_norm)
     except AttributeError:
         pass
 
+    # --- 2D tracker update (pixel-space coords) ---------------------------
+    # Update the lightweight per-frame tracker used for UI metrics and
+    # quick pixel-based speed calculations.
     update_tracker_from_landmarks(tracker, landmarks, w, h)
 
+    # --- Target spawn logic ----------------------------------------------
+    # If there is no current target and the spawn timer allows it, compute
+    # a new target center based on the player's pose and select its type.
     if TARGET_CENTER is None and landmarks is not None and now >= next_target_spawn_ts:
         TARGET_CENTER    = respawn_target(landmarks, w, h, TARGET_RADIUS)
         CURRENT_TYPE     = choose_punch_type()
         TARGET_GLOVE_KEY = choose_target_glove_key(CURRENT_TYPE)
         print(CURRENT_TYPE)
         last_spawn_ts, circle_spawn_ts, protect_release_ts = _get_spawn_timing(now, SPAWN_PROTECT_S)
-        # Record buffer length at spawn so we can slice only frames from
-        # this punch when running inference at collision time.
+        # Record the world buffer length at spawn so inference later uses
+        # only frames captured since this spawn (one punch per clip).
         spawn_buf_len = len(world_frame_buffer)
 
+    # --- Collision detection (player action vs. target) ------------------
     collide   = False
     protecting = protect_release_ts is not None and now < protect_release_ts
     if landmarks is not None and TARGET_CENTER is not None and not protecting:
         collide = wrists_hit_circle(landmarks, w, h, TARGET_CENTER, TARGET_RADIUS)
 
+    # --- On-collision: metrics collection + prepare inference ------------
     if not protecting and collide:
+        # Reaction time relative to when the target became hittable
         reference_time = circle_spawn_ts if circle_spawn_ts is not None else protect_release_ts
         reaction_time  = now - reference_time
 
+        # Record reaction time globally and per time-window
         reaction_time_punch[CURRENT_TYPE].append(reaction_time)
         window_idx = _get_time_window_index(elapsed)
         if window_idx is not None:
             reaction_time_windows[window_idx][CURRENT_TYPE].append(reaction_time)
             reaction_window_combined[window_idx].append(reaction_time)
 
+        # Compute a simple pixel-space speed estimate for diagnostics
         raw_coords  = tracker.get_last_fifteen_coords()
         speed_value = _compute_speed_value(raw_coords, actual_fps)
         if speed_value is not None:
@@ -839,27 +854,27 @@ while cap.isOpened():
                 speed_windows[window_idx][CURRENT_TYPE].append(speed_value)
                 speed_window_combined[window_idx].append(speed_value)
 
-        # ── Model inference ──────────────────────────────────────────────────
+        # --- Model inference (classify the punch) ------------------------
         predicted_punch = None
         confidence      = None
         is_confident    = False
 
-        # Slice to only the frames captured since this target spawned.
-        # This mirrors the notebook, which processes exactly one video
-        # (one punch) per clip — ensuring the velocity peak search finds
-        # the current punch, not stale history.
+        # Prepare a sequence of world-space frames that correspond to the
+        # current punch. This mirrors the offline notebook: one punch -> one clip.
         _buf = list(world_frame_buffer)
         punch_frames = _buf[spawn_buf_len:]
 
-        # Safety fallback: if spawn tracking gave us too few frames (e.g.
-        # the buffer wrapped), use a fixed look-back window instead.
+        # Fallback: if we don't have enough spawn-tracked frames, use a
+        # fixed look-back window sized by LOOK_BACK_SECONDS.
         min_raw = max(2, int(round(LOOK_BACK_SECONDS * actual_fps)))
         if len(punch_frames) < min_raw:
             punch_frames = _buf[-min_raw:]
 
+        # Extract the model clip (resample, smooth, pick peak velocity)
         clip = extract_live_clip(punch_frames, actual_fps)
 
         if clip is not None:
+            # Build model input tensor and run the CNN to get class probabilities
             tensor = build_tensor(clip)                       # (7, CLIP_FRAMES, 4, 3)
             inp    = torch.tensor(tensor, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
@@ -868,6 +883,7 @@ while cap.isOpened():
                 pred_class = int(probs.argmax().item())
                 confidence = float(probs[pred_class].item())
 
+            # Update session stats and accuracy metrics
             predicted_punch = CLASS_NAMES[pred_class]
             attempts_by_type[CURRENT_TYPE] += 1
             punches_thrown += 1
@@ -884,18 +900,18 @@ while cap.isOpened():
 
             probs_dict      = {CLASS_NAMES[i]: round(float(probs[i].item()), 3)
                                for i in range(N_CLASSES)}
-            confidence_flag = "" if is_confident else " ⚠️ low-conf"
+            confidence_flag = "" if is_confident else "low-conf"
             print(f"Model Logits: {logits}")
             print(f"Predicted Punch: {predicted_punch} ({confidence:.1%}){confidence_flag}")
             print(f"All probs: {probs_dict}")
         else:
             needed_raw = max(2, int(round(CLIP_FRAMES / TARGET_FPS * actual_fps)))
-            print(f"⚠️  Warming up — {len(world_frame_buffer)}/{needed_raw} raw frames buffered "
+            print(f"Warming up — {len(world_frame_buffer)}/{needed_raw} raw frames buffered "
                   f"(need {CLIP_FRAMES} frames at {TARGET_FPS} fps after resampling)")
-        # ── End model inference ──────────────────────────────────────────────
 
+        # --- Build overlay text and reset target state -------------------
         if predicted_punch is not None and confidence is not None:
-            confidence_flag = "" if is_confident else " ⚠️"
+            confidence_flag = "" if is_confident else " \u26A0\uFE0F"
             prediction_overlay_text  = (f"Predicted: {predicted_punch.title()} "
                                         f"({confidence:.0%}){confidence_flag}")
             prediction_overlay_color = (0, 255, 0) if is_confident else (0, 165, 255)
@@ -905,6 +921,7 @@ while cap.isOpened():
             prediction_overlay_color = (220, 220, 220)
         prediction_overlay_until = now + PREDICTION_OVERLAY_SECONDS
 
+        # Clear the current target and schedule next spawn
         TARGET_CENTER    = None
         CURRENT_TYPE     = None
         TARGET_GLOVE_KEY = None
@@ -914,6 +931,7 @@ while cap.isOpened():
         print(correct_by_type)
         print(attempts_by_type)
 
+    # --- Render target (glove image or fallback circle) ------------------
     if TARGET_CENTER is not None and CURRENT_TYPE is not None:
         glove_image = glove_images.get(TARGET_GLOVE_KEY)
         if glove_image is not None:
@@ -922,9 +940,13 @@ while cap.isOpened():
             color = PUNCH_COLORS.get(CURRENT_TYPE, (0, 0, 255))
             cv2.circle(image, TARGET_CENTER, TARGET_RADIUS, color, -1)
 
+    # --- Flying-blocks defense drill update (visual + stats) ----------
     defense_game.update(image, landmarks, now)
+
+    # --- Display preparation (mirror for user-facing view) ------------
     display_image = cv2.flip(image, 1)
 
+    # --- Prediction overlay: show recent model result on-screen --------
     if prediction_overlay_text and now <= prediction_overlay_until:
         overlay_font      = cv2.FONT_HERSHEY_DUPLEX
         overlay_scale     = 1.0
@@ -946,6 +968,7 @@ while cap.isOpened():
                     overlay_font, overlay_scale, prediction_overlay_color,
                     overlay_thickness, cv2.LINE_AA)
 
+    # --- Show frame and handle quit / runtime limit --------------------
     show_frame(WINDOW_NAME, display_image)
     if wait_key(1):
         break
@@ -954,6 +977,7 @@ while cap.isOpened():
 
 
 # ── Session metrics ──────────────────────────────────────────────────────────
+# Flatten all recorded reaction times (in seconds).
 all_reaction_times = [t for times in reaction_time_punch.values() for t in times]
 
 
@@ -961,12 +985,14 @@ def round_or_none(value, digits=2):
     return round(value, digits) if value is not None else None
 
 
+# Per-punch-type mean reaction time (converted to milliseconds), None if no samples.
 reaction_types_ms = {}
 for punch_type, times in reaction_time_punch.items():
     reaction_types_ms[punch_type] = (
         round_or_none((sum(times) / len(times)) * 1000) if times else None
     )
 
+# Per-window (10s segment) mean reaction times in ms.
 reaction_all_points_ms = []
 for window_times in reaction_window_combined:
     reaction_all_points_ms.append(
@@ -974,6 +1000,7 @@ for window_times in reaction_window_combined:
         if window_times else None
     )
 
+# Overall reaction time statistics (mean / best / worst) in milliseconds.
 if all_reaction_times:
     reaction_average_ms = round_or_none((sum(all_reaction_times) / len(all_reaction_times)) * 1000)
     reaction_best_ms    = round_or_none(min(all_reaction_times) * 1000)
@@ -981,6 +1008,7 @@ if all_reaction_times:
 else:
     reaction_average_ms = reaction_best_ms = reaction_worst_ms = None
 
+# Per-punch-type accuracy percentage (None when there were no attempts).
 accuracy_types = {}
 for punch_type in reaction_time_punch:
     attempts = attempts_by_type[punch_type]
@@ -989,6 +1017,7 @@ for punch_type in reaction_time_punch:
         round_or_none((correct / attempts) * 100) if attempts else None
     )
 
+# Per-window (10s) accuracy percentages; None for windows with no attempts.
 window_accuracy_points = []
 for window in accuracy_windows:
     window_accuracy_points.append(
@@ -996,6 +1025,7 @@ for window in accuracy_windows:
         if window["attempts"] else None
     )
 
+# Overall session accuracy as percent (None if no punches thrown).
 overall_accuracy_percent = (
     round_or_none((correct_punches_thrown / punches_thrown) * 100)
     if punches_thrown else None
@@ -1005,14 +1035,17 @@ valid_accuracy_points = [pt for pt in window_accuracy_points if pt is not None]
 accuracy_best  = max(valid_accuracy_points) if valid_accuracy_points else None
 accuracy_worst = min(valid_accuracy_points) if valid_accuracy_points else None
 
+# Flattened list of punch speed estimates (px/s) collected during the session.
 all_speeds = [s for values in speed_by_type.values() for s in values]
 
+# Average speed per punch type (px/s), None if absent.
 speed_types = {}
 for punch_type, values in speed_by_type.items():
     speed_types[punch_type] = (
         round_or_none(sum(values) / len(values)) if values else None
     )
 
+# Average speed per time-window (px/s); one value per 10s segment.
 speed_all_points = []
 for window_values in speed_window_combined:
     speed_all_points.append(
@@ -1020,6 +1053,7 @@ for window_values in speed_window_combined:
         if window_values else None
     )
 
+# Overall speed statistics (average, best, worst) in px/s.
 if all_speeds:
     speed_average = round_or_none(sum(all_speeds) / len(all_speeds))
     speed_best    = round_or_none(max(all_speeds))
@@ -1027,20 +1061,24 @@ if all_speeds:
 else:
     speed_average = speed_best = speed_worst = None
 
+# Map session thirds to speed-segment averages.
 speed_segments = {
     "first_third":  speed_all_points[0],
     "second_third": speed_all_points[1],
     "final_third":  speed_all_points[2],
 }
 
+# Flying-blocks drill event counts (blocked/dodged/hit).
 defense_totals       = defense_game.get_stats()
 defense_total_events = sum(defense_totals.values())
+# Percentage of incoming targets avoided (blocked + dodged), None if no events.
 punches_avoided_percent = (
     round_or_none(
         ((defense_totals["blocked"] + defense_totals["dodged"]) / defense_total_events) * 100
     ) if defense_total_events else None
 )
 
+# Percentage of each body area that was exposed (uncovered) expressed as %.
 critical_hit_percentages = {}
 for area_key, stats in coverage_tracker.items():
     critical_hit_percentages[area_key] = (
@@ -1048,6 +1086,7 @@ for area_key, stats in coverage_tracker.items():
         if stats["total"] else None
     )
 
+# Relative exposure weights per body area (0..1), higher means more exposed.
 exposure_weights_values = {}
 for area_key, stats in exposure_tracker.items():
     exposure_weights_values[area_key] = (
@@ -1055,16 +1094,19 @@ for area_key, stats in exposure_tracker.items():
         if stats["total"] else None
     )
 
+# Accuracy per third of session to capture endurance trends.
 endurance_segments = {
     "first_third":  round_or_none(window_accuracy_points[0]) if len(window_accuracy_points) > 0 else None,
     "second_third": round_or_none(window_accuracy_points[1]) if len(window_accuracy_points) > 1 else None,
     "final_third":  round_or_none(window_accuracy_points[2]) if len(window_accuracy_points) > 2 else None,
 }
 
+# Session identifiers and ISO timestamp for traceability.
 fighter_id    = "fighter_sample_001"
 session_id    = f"session_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 timestamp_iso = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
+# Build the structured session payload for JSON export.
 session_payload = [{
     "fighter_id":      fighter_id,
     "session_id":      session_id,

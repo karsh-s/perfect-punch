@@ -1,23 +1,27 @@
 from pathlib import Path
 import random
+from typing import Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 try:
     import mediapipe as mp
+
     mp_pose = mp.solutions.pose
     MEDIAPIPE_AVAILABLE = True
 except ImportError:
+    # MediaPipe is optional for some unit tests / CI environments
     print("Warning: MediaPipe not available in target_utils")
     mp = None
     mp_pose = None
     MEDIAPIPE_AVAILABLE = False
 
+
 PUNCH_COLORS = {
     "jab": (0, 0, 255),        # red
     "hook": (0, 255, 0),       # green
-    "uppercut": (255, 0, 0)    # blue
+    "uppercut": (255, 0, 0),   # blue
 }
 
 PUBLIC_ASSET_DIR = Path(__file__).resolve().parents[1] / "public"
@@ -32,7 +36,7 @@ HAND_CONTACT_LANDMARKS = (
     # Wrists
     "LEFT_WRIST",
     "RIGHT_WRIST",
-    # Fingertips/hand edges commonly reaching glove first
+    # Fingertips / hand edges commonly reaching glove first
     "LEFT_INDEX",
     "RIGHT_INDEX",
     "LEFT_THUMB",
@@ -41,26 +45,56 @@ HAND_CONTACT_LANDMARKS = (
     "RIGHT_PINKY",
 )
 
-#Convert normalized landmark to pixel coordinates
-def _to_px(lm, w, h):
+
+def _to_px(lm, w: int, h: int) -> Tuple[int, int]:
+    """Convert a normalized landmark (with .x and .y in [0,1]) to pixel coords.
+
+    Args:
+        lm: landmark object with attributes `x` and `y` (normalized coordinates).
+        w: image width in pixels.
+        h: image height in pixels.
+
+    Returns:
+        (x, y) pixel coordinates as integers.
+    """
+
     return int(lm.x * w), int(lm.y * h)
 
 #Respawn target within the area defined by shoulders, hips, and nose
-def respawn_target(landmarks, w, h, target_radius):
+def respawn_target(landmarks, w: int, h: int, target_radius: int) -> Optional[Tuple[int, int]]:
+    """Choose a random target position constrained to the player's upper body.
+
+    The spawn area is computed from shoulders, hips, and nose landmarks to keep
+    targets around the chest/upper torso region.
+
+    Args:
+        landmarks: sequence of MediaPipe landmarks (indexable by enum `.value`).
+        w: frame width in pixels.
+        h: frame height in pixels.
+        target_radius: radius of the logical target in pixels.
+
+    Returns:
+        (x, y) pixel coordinates for the respawn position, or None when a
+        valid spawn region cannot be computed.
+
+    Notes:
+        If MediaPipe is not available, returns the center of the frame for tests.
+    """
+
     if not MEDIAPIPE_AVAILABLE:
         # Return a dummy target position for testing
-        return (w//2, h//2)
-        
+        return (w // 2, h // 2)
+
     ls = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
     rs = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
     lh = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value]
     rh = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value]
     nose = landmarks[mp_pose.PoseLandmark.NOSE.value]
 
-    (lsx, lsy) = _to_px(ls, w, h)
-    (rsx, rsy) = _to_px(rs, w, h)
-    (lhy, rhy) = (_to_px(lh, w, h)[1], _to_px(rh, w, h)[1])
-    (nx, ny)   = _to_px(nose, w, h)
+    lsx, lsy = _to_px(ls, w, h)
+    rsx, rsy = _to_px(rs, w, h)
+    lhy, rhy = _to_px(lh, w, h)[1], _to_px(rh, w, h)[1]
+    nx, ny = _to_px(nose, w, h)
 
     shoulder_width = abs(rsx - lsx)
 
@@ -83,7 +117,30 @@ def respawn_target(landmarks, w, h, target_radius):
 # Detect if hand landmarks intersect target area.
 # The rendered glove is visually larger than the logical spawn circle,
 # so we expand the collision radius for a more intuitive "what you see is what hits" feel.
-def wrists_hit_circle(landmarks, w, h, center, radius, hit_radius_scale=3.0, min_visibility=0.35):
+def wrists_hit_circle(
+    landmarks,
+    w: int,
+    h: int,
+    center: Optional[Tuple[int, int]],
+    radius: int,
+    hit_radius_scale: float = 3.0,
+    min_visibility: float = 0.35,
+) -> bool:
+    """Return True if any hand landmark intersects the target circle.
+
+    Args:
+        landmarks: sequence of MediaPipe landmarks.
+        w: image width.
+        h: image height.
+        center: (x, y) center of the target in pixels.
+        radius: logical target radius in pixels.
+        hit_radius_scale: visual expansion factor for collision detection.
+        min_visibility: minimum landmark visibility to consider it valid.
+
+    Returns:
+        True if a hand landmark lies within the (expanded) target radius.
+    """
+
     if center is None or not MEDIAPIPE_AVAILABLE:
         return False
 
@@ -104,35 +161,53 @@ def wrists_hit_circle(landmarks, w, h, center, radius, hit_radius_scale=3.0, min
     return False
 
 #Randomly choose a punch type based on defined probabilities (Will update to use coach agent to determine probabilities)
-def choose_punch_type():
+def choose_punch_type() -> str:
+    """Randomly pick a punch type using predefined probabilities.
+
+    Probabilities (empirical):
+      - jab: 62.5%
+      - hook: 25%
+      - uppercut: 12.5%
+    """
+
     r = random.random()
     if r < 0.625:
         return "jab"
-    elif r < 0.625 + 0.25:
+    if r < 0.625 + 0.25:
         return "hook"
-    else:
-        return "uppercut"
+    return "uppercut"
 
 
-def choose_target_glove_key(punch_type=None):
+def choose_target_glove_key(punch_type: Optional[str] = None) -> str:
+    """Return the glove asset key appropriate for the given `punch_type`.
+
+    Args:
+        punch_type: one of 'jab', 'hook', 'uppercut' or None.
+
+    Returns:
+        Key for `TARGET_GLOVE_ASSETS` to load an image.
     """
-    Choose a punchpad image key based on punch type.
-    - jab: front punchpad
-    - hook: randomly left or right punchpad
-    - uppercut: up punchpad
-    """
+
     if punch_type == "jab":
         return "jab_front"
-    elif punch_type == "hook":
+    if punch_type == "hook":
         return random.choice(["hook_left", "hook_right"])
-    elif punch_type == "uppercut":
+    if punch_type == "uppercut":
         return "uppercut_up"
-    else:
-        # Fallback
-        return random.choice(list(TARGET_GLOVE_ASSETS.keys()))
+    # Fallback
+    return random.choice(list(TARGET_GLOVE_ASSETS.keys()))
 
 
-def load_target_glove_image(glove_key):
+def load_target_glove_image(glove_key: str) -> Optional[np.ndarray]:
+    """Load the glove image for a given asset key.
+
+    Args:
+        glove_key: key from `TARGET_GLOVE_ASSETS`.
+
+    Returns:
+        BGR(A) image as a numpy array, or None if the file is missing.
+    """
+
     filename = TARGET_GLOVE_ASSETS.get(glove_key)
     if not filename:
         return None
@@ -144,7 +219,26 @@ def load_target_glove_image(glove_key):
     return cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
 
 
-def draw_target_glove(frame, center, radius, glove_image, glove_key=None):
+def draw_target_glove(
+    frame: np.ndarray,
+    center: Optional[Tuple[int, int]],
+    radius: int,
+    glove_image: Optional[np.ndarray],
+    glove_key: Optional[str] = None,
+) -> np.ndarray:
+    """Draw a glove image centered on `center` onto `frame`.
+
+    Args:
+        frame: HxWx3 BGR image that will be modified in-place.
+        center: (x, y) center position in pixels.
+        radius: logical target radius in pixels (controls visual size).
+        glove_image: loaded glove image (BGR or BGRA).
+        glove_key: optional key used for debug/selection (unused here).
+
+    Returns:
+        The modified `frame` (same object passed in).
+    """
+
     if frame is None or center is None or glove_image is None:
         return frame
 

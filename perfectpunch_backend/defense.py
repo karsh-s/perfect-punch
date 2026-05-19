@@ -12,7 +12,20 @@ ARM_PADDING = 20
 
 
 class DefenseSquare:
-    """Represents a moving square target."""
+    '''
+    Initialzies a moving square target
+
+    Parameters:
+        - x (int): starting x-coordinate
+        - y (int): starting y-coordinate (top of square)
+        - size (int): square side length in pixels
+        - dx (int): horizontal velocity (positive: right, negative: left)
+        - side (str): 'L' or 'R' indicating spawn side
+        - color (tuple): BGR color used for drawing
+    
+    Notes:
+        - This is a lightweight container for square state used by the game loop
+    '''
 
     def __init__(self, x, y, size, dx, side, color):
         self.x = x
@@ -22,9 +35,22 @@ class DefenseSquare:
         self.side = side  # 'L' for left-to-right, 'R' for right-to-left
         self.color = color
 
+'''
+Create and return a new DefenseSquare that starts off the left or right edge
 
+Parameter:
+    - w (int): frame width in pixels
+    - h (int): frame height in pixels
+
+Behavior:
+    - Chooses spawn side randomly
+    - Picks a vertical position between 20% and 80% of the frame height (clamped)
+    - Uses module constant for size, speed, and color
+
+Returns:
+    - DefenseSquare: a newly-initialized square positioned to enter the frame
+'''
 def spawn_square(w, h):
-    """Create a new square that starts from the left or right edge of the frame."""
 
     side = random.choice(["L", "R"])
     size = SQUARE_SIZE
@@ -41,7 +67,30 @@ def spawn_square(w, h):
 
     return DefenseSquare(x, y, size, dx, side, SQUARE_COLOR)
 
+'''
+Classify interaction between the provided square and the player pose
 
+Parameters:
+    - landmarks: a sequence-like container of normalized landmarks (each with .x and .y)
+      or an object indexable by mp_pose.PoseLandmark enum values
+    - w (int): frame width (pixels)
+    - h (int): frame height (pixels)
+    - square (DefenseSquare): the active target to test
+
+Returns:
+    - "Block" | "Hit" | "Dodge" | None
+
+Behavior:
+    - Converts selected landmarks to pixel coordinates
+    - Defines padded bounding rects for each arm and checks rectangle overlap for a "Block"
+    - Tests overlap with torso/head region for a "Hit"
+    - Uses the horizontal center of the shoulders to classify a "Dodge" if the square passes the center
+    - Returns None when no meaningful interaction is detected or inputs are invalid
+
+Notes:
+    - If landmarks or square is None, returns None
+    - Assume landmakrs provide valid .x and .y; missing values may raise
+'''
 def check_collision(landmarks, w, h, square):
     """Classify the interaction between the moving square and the defender."""
 
@@ -117,10 +166,28 @@ def check_collision(landmarks, w, h, square):
 class DefenseGame:
     """Stateful manager for the flying-blocks defense drill."""
 
+
+    '''
+    Initialize the defense game manager
+
+    Parameters:
+        - spawn_delay_range (tuple[int, int]): inclusive min/max seconds for respawn delays
+    
+    Behavior:
+        - Sets configuration and calls reset() to clear state and stats
+    '''
     def __init__(self, spawn_delay_range=SPAWN_DELAY_RANGE):
         self.spawn_delay_range = spawn_delay_range
         self.reset()
 
+
+    '''
+    Reset game state and stats
+
+    Behavior:
+        - Clears the active square, spawn buffers, and statistics counters
+        - Prepares the game for a fresh session
+    '''
     def reset(self):
         self.current_square = None
         self.spawn_buffer = 0.0
@@ -131,12 +198,51 @@ class DefenseGame:
             "hit": 0,
         }
 
+
+    '''
+    Schedule the next square spawn
+
+    Parameters:
+        - now (float): current timestamp (seconds)
+    
+    Behavior:
+        - Samples a random delay within self.spawn_delay_range
+        - Sets self.spawn_buffer to the delay and self.despawn_time to now
+        - Clears self.current_square so a new one may spawn after the delay
+
+    Notes:
+        - Internal helper; intended to be called after a hit/block/dodge
+    '''
     def _schedule_respawn(self, now):
         delay = random.randint(*self.spawn_delay_range)
         self.spawn_buffer = float(delay)
         self.despawn_time = now
         self.current_square = None
 
+
+    '''
+    Advance game state for one frame, draw the square, and return any outcome
+
+    Parameters:
+        - frame (numpy.ndarray): HxWx3 image; will be drawn onto in-place
+        - landmarks: pose landmarks used for collision checks (see check_collision)
+        - now (float): current timestamp (seconds)
+    
+    Returns:
+        - "Block" | "Hit" | "Dodge" | None
+    
+    Behavior:
+        - Spawns a new square when appropriate based on respawn timers
+        - Moves the active square horizontally each update
+        - calls check_collsion() and updates self.stats and respawn scheduling on outcomes
+        - Draws the active square onto frame using cv2.rectangle
+        - Returns the detected outcome or None
+
+    Notes:
+        - Mutates frame and internal game state
+        - frame must be a writable image array
+        - now should be monotonic (time.time()); precise timing affects spawn behavior
+    '''
     def update(self, frame, landmarks, now):
         """Advance game state, draw the active square, and return any outcome."""
 
@@ -181,5 +287,14 @@ class DefenseGame:
 
         return outcome
 
+    '''
+    Return a snapshot of game statistics
+
+    Returns:
+        - dict: copy of stats with keys 'blocks','dodges', and 'hit'
+    
+    Notes:
+        - Returns a shallow copy to avoid external mutation of internal counters
+    '''
     def get_stats(self):
         return dict(self.stats)
